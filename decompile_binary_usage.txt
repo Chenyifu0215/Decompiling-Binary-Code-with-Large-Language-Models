@@ -1,0 +1,110 @@
+decompile_binary.py 用法说明
+===========================
+
+脚本版本：v2.0.0
+功能：基于 PyGhidra 的批量反编译脚本，支持单文件/目录/通配符输入，
+      可对二进制文件的全部函数进行反编译并输出 C 代码。
+
+主要特性：
+  - 批量反编译（单个文件、整个目录、glob 通配符匹配）
+  - 多进程并行处理（--parallel）
+  - 断点续跑（--resume）
+  - 试运行模式（--dry-run）
+  - 支持 JSON/YAML 配置文件（--config）
+  - 导出元数据 JSON（--meta）
+  - 指定特定函数反编译（-f）
+  - 递归扫描目录（--recursive）
+
+======================================================================
+环境要求
+======================================================================
+
+1. 设置 Ghidra 安装路径（环境变量或 --ghidra-dir）：
+
+   $env:GHIDRA_INSTALL_DIR = "C:\ghidra\ghidra12.1"
+
+2. 安装 pyghidra 包（从 Ghidra 自带的 PyGhidra 功能安装）
+
+======================================================================
+终端运行示例
+======================================================================
+
+# 基本用法：反编译单个文件
+python decompile_binary.py sample.exe -o ./output
+
+# 反编译整个目录
+python decompile_binary.py ./input_dir -o ./output --recursive
+
+# 4 进程并行处理
+python decompile_binary.py ./bins -o ./out --parallel 4
+
+# 全部函数输出到单文件
+python decompile_binary.py malware.dll --single-file -O all_decomp.c
+
+# 指定架构和编译器
+python decompile_binary.py sample.exe -o ./output --lang "x86:LE:64:default"
+
+# 指定反编译特定函数（地址或名称）
+python decompile_binary.py binary.exe -f 0x401000 main -o ./out
+
+# 试运行（列出会处理的文件但不实际反编译）
+python decompile_binary.py ./binaries -o ./out --dry-run
+
+# 带超时和断点续跑
+python decompile_binary.py ./targets -o ./out --timeout 600 --resume state.json
+
+# 仅列出函数列表
+python decompile_binary.py binary.exe --list-functions
+
+# 跳过自动分析
+python decompile_binary.py sample.exe --no-analyze -o ./out
+
+# 指定 Ghidra 安装目录
+python decompile_binary.py sample.exe --ghidra-dir "C:\ghidra\ghidra12.1" -o ./out
+
+# 使用配置文件
+python decompile_binary.py ./targets -o ./out --config decompile_config.json
+
+======================================================================
+主要参数说明
+======================================================================
+
+输入/输出:
+  inputs                二进制文件、目录或通配符模式
+  -o, --output-dir      输出目录（未指定时默认使用 ./decompiled_output）
+  -O, --output-file     单输出文件路径
+  --single-file         所有函数写入一个文件（需配合 -O）
+  --mirror              在输出中镜像输入目录结构
+
+处理:
+  --parallel N          并行工作进程数（0=顺序, -1=CPU核心数）
+  --timeout N           单文件超时（秒）, 0=无限制；超时会终止该文件的处理进程
+  --no-analyze          跳过 Ghidra 自动分析
+  --lang ID             Ghidra 语言 ID (如 x86:LE:64:default)
+  --compiler ID         Ghidra 编译器 ID (如 gcc, windows)
+  -f, --functions       指定要反编译的函数（地址如 0x401000 或名称）
+  --max-memory SIZE     最大 JVM 堆大小 (如 4G, 8192M)
+  --recursive           递归扫描输入目录
+  --follow-symlinks     扫描目录时跟随符号链接
+  --skip-non-binary     仅处理已知二进制扩展名的文件
+
+管理:
+  --overwrite           覆盖已有输出文件
+  --resume PATH         断点续跑状态文件
+  --dry-run             仅列出将处理的文件，不实际反编译
+  --config PATH         JSON 或 YAML 配置文件
+  --log-file PATH       日志输出到文件
+
+元数据/信息:
+  --meta                导出程序元数据为 JSON
+  --list-functions      仅列出函数名和地址
+
+Ghidra:
+  --ghidra-dir PATH     Ghidra 安装目录
+  --project-dir DIR     Ghidra 项目目录
+  --project-name NAME   Ghidra 项目名称
+
+调试:
+  -v, --verbose         详细输出
+  -q, --quiet           仅输出错误信息
+  --version             显示版本号

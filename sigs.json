@@ -1,0 +1,3 @@
+[
+  {"name": "apply_op", "signature": "int apply_op(int op, int a, int b)"}
+]

@@ -1,0 +1,117 @@
+decompile_helper.py 用法说明
+===========================
+
+脚本版本：v1.0.0
+功能：与 decompile_binary.py 搭配使用（不修改原脚本），把 Ghidra 反编译出的
+      伪 C 代码补齐为可编译、可链接的工程。Ghidra 输出默认无法直接编译，
+      缺失类型定义、全局数据定义、跨文件声明，本脚本自动生成这些部分。
+
+主要功能：
+  - 生成 Ghidra 伪类型 typedef（ghidra_types.h）
+  - 生成跨文件函数声明（function_prototypes.h）
+  - 生成全局变量 extern 声明（globals.h）
+  - 从二进制按地址提取 DAT_* 数据（data_defs.c）
+  - 生成平台兼容 shim（compat.h）
+  - 生成完整可编译工程 + Makefile（Linux gcc）+ build.ps1（Windows MSVC）
+
+======================================================================
+环境要求
+======================================================================
+
+  仅需 Python 3（无需 pyghidra，不依赖 Ghidra 运行环境）。
+
+======================================================================
+子命令一览
+======================================================================
+
+  types     生成 ghidra_types.h
+  prototypes 生成 function_prototypes.h
+  globals   生成 globals.h（全局变量 extern 声明）
+  extract   生成 data_defs.c（DAT_* 数据 + 命名全局变量定义）
+  all       一键生成完整工程（推荐）
+
+======================================================================
+终端运行示例
+======================================================================
+
+# 一键生成完整可编译工程（推荐，最常用）
+python decompile_helper.py all bomb_linux decomp_output/bomb_linux_decomp -o decomp_build/bomb_build
+
+# 分步使用
+python decompile_helper.py types -o ghidra_types.h
+python decompile_helper.py prototypes decomp_output/bomb_linux_decomp -o function_prototypes.h
+python decompile_helper.py globals   bomb_linux decomp_output/bomb_linux_decomp -o globals.h
+python decompile_helper.py extract   bomb_linux decomp_output/bomb_linux_decomp -o data_defs.c
+
+# 对 PE 二进制（Windows exe）同样适用
+python decompile_helper.py all test_binary.exe decomp_output/test_binary_decomp -o decomp_build/testbin_build
+
+======================================================================
+all 子命令参数
+======================================================================
+
+  binary        原始二进制文件路径（用于提取 DAT_* 数据、解析符号表）
+  decomp_dir    反编译输出目录（decompile_binary.py 生成的一函数一文件目录）
+  -o, --output-dir  输出工程目录（默认 decomp_build/<binary>_build）
+
+======================================================================
+生成的产物说明
+======================================================================
+
+  ghidra_types.h        Ghidra 伪类型 typedef：undefined/undefined1..8、
+                        byte/ushort/uint/ulong/ulonglong/code 等
+  compat.h              平台兼容：MSVC 下 shim timespec、clock_gettime、
+                        __ctype_b_loc（glibc 内联的 isspace/isxdigit）；
+                        __isoc99_sscanf 宏映射到 sscanf
+  function_prototypes.h 各函数 extern 声明（自动排除 libc 桩与 CRT 入口）
+  globals.h             命名全局变量 extern 声明（类型按大小/用法启发式推断）
+  data_defs.c           DAT_* 数据定义（字符串逐字节还原为转义字面量）+ 全局变量定义
+  *.c                   保留的程序函数源码（已排除的 libc 桩不会复制）
+  Makefile              Linux 下用 gcc 编译链接
+  build.ps1             Windows 下用 MSVC 编译链接
+
+======================================================================
+编译与链接
+======================================================================
+
+  Linux（ELF 目标，推荐）：
+    cd decomp_build/bomb_build
+    make
+
+  Windows（MSVC，用于语法检查/验证）：
+    cd decomp_build/bomb_build
+    .\build.ps1
+
+======================================================================
+自动处理的内容
+======================================================================
+
+  - DAT_* 匿名数据：按地址从二进制精确提取（字符串/字节数组）
+  - 命名全局变量：ELF 带符号时从 .symtab 识别并推断类型
+    （FILE* 靠 fopen/stdin 用法识别，其余按大小映射为 long/int/short/char 数组）
+  - libc 桩排除：自动跳过 PLT 桩（含 halt_baddata 的函数），链接系统真实 libc
+
+======================================================================
+仍需手动处理的情况
+======================================================================
+
+  1. 不可恢复跳转表函数（脚本会提示，如 goto_buf_0/1/2）：反编译器无法恢复
+     switch 跳转表，签名/函数体需手工重建。
+  2. 全局变量类型推断为启发式：结构体、指针数组、有符号/无符号等复杂类型
+     可能不准确，需校对 globals.h 与 data_defs.c。
+  3. 静态链接的 CRT（如 test_binary.exe 的 486 个 CRT 函数）不含 halt_baddata，
+     不会被自动排除，与系统 CRT 冲突，需手动指定要编译的文件。
+  4. 剥离符号的 PE：命名全局变量丢失，全部退化为 DAT_* 字节数组，
+     类型与语义需手动重建。
+  5. 未覆盖的 glibc 内部符号（如 __stack_chk_fail、__printf_chk）若出现，
+     需自行在 compat.h 补充 shim。
+
+======================================================================
+注意事项
+======================================================================
+
+  - 生成的数据字面量对非 ASCII 字节使用八进制转义，保证跨编译器一致。
+  - 反编译代码里的 &DAT_xxxx 传参会产生一级间接类型不匹配的警告（已用
+    /w、-w 抑制），地址正确、不影响运行。
+  - bomb_linux 实测：99 个函数排除 24 个桩后，73/76 编译通过，补 3 处
+    跳转表签名后完整编译+链接+运行成功。
