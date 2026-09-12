@@ -142,10 +142,20 @@ def main():
             continue
 
         try:
-            c_code, asm, xrefs = export_evidence(program, func, decompiler, listing)
+            # 汇编/调用点从 Ghidra 导出，仅作语义辅助证据。
+            _, asm, xrefs = export_evidence(program, func, decompiler, listing)
         except Exception as e:
             LOG.warning("%s: 证据导出失败 %s", name, e)
             continue
+
+        # 伪代码必须用 build 目录里「已处理」的 .c（decompile_helper 已改写过
+        # slice/struct/全局名），否则 LLM 基于 Ghidra 原始反编译生成的补丁 old
+        # 文本与补丁应用目标不一致，导致大量 "replace target not found"。
+        build_c_path = build_dir / fname
+        if build_c_path.exists():
+            c_code = build_c_path.read_text(encoding="utf-8", errors="replace")
+        else:
+            c_code = export_evidence(program, func, decompiler, listing)[0]
 
         patches = llm.infer_type_fixes(name, c_code, asm, xrefs, file_errs)
         if patches is None and slow_llm is not None:
@@ -155,6 +165,11 @@ def main():
             LOG.warning("%s: LLM 无补丁", name)
             continue
 
+        # 强制补丁落到「报错的那个文件」，避免 LLM 用函数名生成不带地址后缀
+        # 的 file（同名函数）导致补丁找错文件。
+        for p in patches:
+            if isinstance(p, dict):
+                p["file"] = fname
         applied, app_errs = apply_patch_list(str(build_dir), patches)
         if applied:
             fixed += 1

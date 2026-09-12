@@ -1,0 +1,186 @@
+================================================================================
+Ghidra 静态反编译修复工程 - 使用说明 (work.txt)
+================================================================================
+
+一、工程概述
+--------------------------------------------------------------------------------
+把 Ghidra 反编译出的伪 C（含 undefined 类型、slice 语法、缺失声明、类型混淆）
+自动改写成可编译的 C。核心是「静态修复闭环」：
+
+    反编译 → 预处理 → LLM 签名/类型修复 → 编译 → 失败则迭代修复
+
+收敛判据 = 编译错误数减少。三层目标：
+  1. 反编译质量（Ghidra 输出尽可能正确）
+  2. 编译通过（伪代码能编译、能链接）
+  3. 功能正确（运行时行为一致，需动态验证）
+
+二、文件清单
+--------------------------------------------------------------------------------
+  decompile_binary.py     反编译（PyGhidra；自动导入 libc 类型+签名；同名函数加地址后缀）
+  decompile_helper.py     生成可编译工程（类型 shim、slice/数组赋值/struct 修复、
+                          全局变量用法推断、符号表反查、DAT 可写推断）
+  fix_signatures_llm.py   LLM 签名修复（证据包 -> LLM 推断签名 -> 回灌 Ghidra）
+  fix_types_llm.py        LLM 类型/结构体错误修复（生成补丁修 .c 文件）
+  fix_undeclared.py       错误驱动补全未声明符号（函数/数据，读编译 log）
+  fix_signatures.py       签名修复基础版（按 sigs.json 手工指定）
+  orchestrator.py         静态编译修复闭环（fallback 规则库 / LLM 补丁）
+  llm.py                  LLM proposer 模块（DeepSeek 调用 + fallback 规则库）
+  patch.py                补丁引擎（replace/regex，可重放）
+  decompile_gui.py        桌面 GUI（拖拽反编译 + 签名修复 + 生成工程 + 静态修复）
+  test_core.py            单元测试（纯函数，61 用例）
+  test_golden.py          黄金回归（repair_source_file 整体验证）
+  test_e2e.py             端到端（生成工程 -> make 编译通过）
+
+三、环境依赖
+--------------------------------------------------------------------------------
+  - Python 3.12 + PyGhidra（Ghidra 12.1 安装）+ PySide6（GUI）
+  - GHIDRA_INSTALL_DIR 或默认 C:/ghidra/ghidra12.1
+  - WSL（Windows 下 make/gcc 编译）
+  - LLM_API_KEY（DeepSeek）
+
+  环境变量：
+    LLM_API_KEY     （必需，LLM 修复时）DeepSeek / OpenAI 兼容 API key
+    LLM_BASE_URL    （可选）默认 https://api.deepseek.com/v1
+    LLM_MODEL       （可选）默认 deepseek-chat（快）
+    GHIDRA_SIG_PROJECTS （可选）逗号分隔的项目签名表名（如 busybox），
+                    启用项目特有内部库签名（默认关闭，只走通用表）
+
+四、完整流程（推荐）
+--------------------------------------------------------------------------------
+  # 1. 反编译（含 libc 类型/签名自动导入）
+  python decompile_binary.py <binary> -o <work>
+
+  # 2. 生成可编译工程（含 libc 过滤）
+  python decompile_helper.py all <binary> <work>/<stem>_decomp \
+      -o <work>/<stem>_build --map <binary>.map
+
+  # 3. LLM 签名修复（预筛只修报错的，省成本）
+  python fix_signatures_llm.py <binary> --prescreen \
+      --build-dir <work>/<stem>_build -o <work>/<stem>_decomp
+
+  # 4. 重新生成工程
+  python decompile_helper.py all <binary> <work>/<stem>_decomp \
+      -o <work>/<stem>_build --map <binary>.map
+
+  # 5. LLM 类型修复
+  python fix_types_llm.py <binary> <work>/<stem>_decomp \
+      --build-dir <work>/<stem>_build
+
+  # 6. 错误驱动补全未声明符号（可重复执行直到 undeclared 收敛）
+  python fix_undeclared.py <binary> <work>/<stem>_build
+
+  # 7. 编译统计
+  wsl make -k -C <work>/<stem>_build -j
+
+五、各脚本详细用法
+--------------------------------------------------------------------------------
+
+■ decompile_binary.py —— 反编译
+    python decompile_binary.py <binary> -o <out_dir> [options]
+
+  关键参数：
+    -o/--output-dir   输出目录（内部创建 <stem>_decomp/ 子目录）
+    --lang            Ghidra 语言 ID（如 x86:LE:64:default，一般自动识别）
+    --no-analyze      跳过自动分析
+    --functions NAME  只反编译指定函数
+    --parallel N      并行度（0=顺序）
+
+  说明：自动导入 generic_clib_64.gdt 的 libc 类型+签名（含 __isoc*/__GI*
+  别名去前缀）；同名函数输出时加地址后缀避免覆盖。
+
+■ decompile_helper.py —— 生成可编译工程
+    python decompile_helper.py all <binary> <decomp_dir> -o <build_dir> [--map <map>]
+
+  子命令：
+    all       生成全部（推荐）
+    types     只写 ghidra_types.h
+    protos    只写 function_prototypes.h
+    globals   只写 globals.h
+    extract   只写 data_defs.c
+
+  关键参数：
+    --map     GNU ld map 文件（过滤静态链接 libc；强烈建议静态二进制使用）
+
+  修复能力（生成工程时自动应用）：
+    - slice 语法修复           auVar3._8_8_ -> *(undefined8 *)((char *)auVar3 + 8)
+    - 数组赋值修复             arr = expr      -> *(undefined8 *)arr = expr
+    - struct 裸名改写          stat *p         -> struct stat *p
+    - 冲突结构体声明           stat local_d0   -> struct stat local_d0
+    - 签名分行合并             undefined1 [16]\n\nfunc -> 同一行
+    - 全局变量用法推断         解引用->指针、位运算->整数（修复 globals.h 类型）
+    - DAT_ 可写推断            被赋值的 DAT_x 声明为指针（非 const 数组）
+    - 符号表规范化反查         dot.0 -> dot_0（为取地址常量生成定义）
+    - 同名函数加 static / 不生成原型
+    - longlong/uchar/uint3..uint7/int3..int7 typedef 补全
+
+■ fix_signatures_llm.py —— LLM 签名修复（核心）
+    python fix_signatures_llm.py <binary> [options]
+
+  关键参数：
+    -o/--output-dir    重新反编译输出目录（覆盖原 decomp）
+    --prescreen        编译预筛：先 make -k 收集 too few/many 报错函数
+    --build-dir        --prescreen 时的 build 目录
+    --functions NAME..  只处理指定函数名
+    --max-functions N   最多处理 N 个
+    --no-sort          不按被调次数排序（默认优先修高频被调函数）
+    --model            快模型（默认 deepseek-chat）
+    --slow-model       慢模型兜底（对快模型失败的重试）
+
+  流程：预筛 -> 导出证据（伪代码+汇编+调用点+callee 锚点）-> LLM 推断签名
+  -> ApplyFunctionSignatureCmd 回灌 -> 重新反编译被改函数+调用者。
+
+■ fix_types_llm.py —— LLM 类型修复
+    python fix_types_llm.py <binary> <decomp_dir> --build-dir <build_dir> [options]
+
+  关键参数：
+    --build-dir        （必需）build 目录
+    --max-functions N  最多处理 N 个
+    --model/--slow-model 同上
+
+  修复：array type / 指针当整数 / 位运算类型不匹配 / invalid use of void。
+  注意：伪代码用 build 目录「已处理」的 .c（保证补丁 old 文本匹配）。
+
+■ fix_undeclared.py —— 错误驱动补全未声明符号
+    python fix_undeclared.py <binary> <build_dir> [--log LOG]
+
+  说明：只处理「编译 log 里真正报 undeclared」的名字（不会像全量符号表
+  反查那样把系统函数也生成出来导致冲突）：
+    - 名字在符号表里是 FUNC   -> 追加 `extern undefined8 name();` 到 function_prototypes.h
+    - 名字在符号表里是 OBJECT -> 追加数据定义到 data_defs.c
+    - 查不到                  -> 追加 `extern undefined8 name;` 兜底
+  可重复执行（每次基于最新编译 log），直到 undeclared 收敛。
+  实测：busybox 1066 -> 949（-117）。
+
+■ orchestrator.py —— 静态修复闭环
+    python orchestrator.py <binary> <decomp_dir> [options]
+
+  关键参数：
+    -o/--build-dir   输出 build 目录
+    --proposer       fallback（默认，规则库）| llm
+    --map            GNU ld map 文件
+    --max-iter       最大迭代轮数
+    --no-prepare     跳过 decompile_helper，直接用现有 build
+
+■ fix_signatures.py —— 手工签名修复
+    python fix_signatures.py <binary> --signatures sigs.json [-o out_dir] [--dump NAME]
+
+  sigs.json 格式：
+    [{"name": "apply_op", "signature": "int apply_op(int op, int a, int b)"}]
+
+■ decompile_gui.py —— 桌面 GUI
+    双击 启动反编译器.bat（或 python decompile_gui.py）
+    功能：拖入二进制 -> 反编译 -> [签名修复] -> [生成工程] -> [静态修复]
+
+六、测试
+--------------------------------------------------------------------------------
+  python -m pytest test_core.py test_golden.py test_e2e.py -q
+  预期：61 passed
+
+七、注意事项
+--------------------------------------------------------------------------------
+  - LLM 功能依赖 LLM_API_KEY；fallback 规则库离线可用。
+  - 静态链接二进制务必配 --map，否则 libc 符号冲突。
+  - 大文件先设 --max-functions 小值试跑，确认效果再全量。
+  - decompile_helper 的全局变量类型推断/符号表反查依赖 ELF 符号表
+    （stripped 二进制会退化为占位/跳过）。
+  - 唯一项目特例（bb_* 签名表）已隔离，通过 GHIDRA_SIG_PROJECTS 按需启用。

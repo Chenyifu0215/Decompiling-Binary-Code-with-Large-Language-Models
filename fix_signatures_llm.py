@@ -213,6 +213,46 @@ def prescreen_errors(build_dir):
     return names
 
 
+def sort_by_call_reference_count(program, funcs):
+    """Sort *funcs* by call-site count (descending).
+
+    A single high-frequency callee with a wrong signature cascades into tens of
+    "too few/many arguments" errors at its call sites. Fixing those first
+    converges fastest, and also ensures --max-functions spends its budget on the
+    highest-impact functions.
+    """
+    rm = program.getReferenceManager()
+
+    def refcount(f):
+        return sum(
+            1 for r in rm.getReferencesTo(f.getEntryPoint())
+            if r.getReferenceType().isCall()
+        )
+
+    return sorted(funcs, key=refcount, reverse=True)
+
+
+def param_type_names(params):
+    """Extract bare type names from LLM-inferred param strings.
+
+    ``["char *arg", "int base"]`` -> ``["char *", "int"]``. Used to feed a
+    fixed function back into the anchor set for multi-level type propagation.
+    Handles C's ``char *arg`` style (star glued to the arg name).
+    """
+    out = []
+    for p in params:
+        p = p.strip()
+        m = re.match(r"^(.*?)(\*+)?\s*([A-Za-z_]\w*)$", p)
+        if m and m.group(3) and m.group(1).strip():
+            typ = m.group(1).strip()
+            if m.group(2):
+                typ += " " + m.group(2)
+            out.append(typ)
+        else:
+            out.append(p)
+    return out
+
+
 def redecompile_selected(program, funcs, output_dir, decompiler):
     """只重新反编译指定的函数集合，写到 output_dir（一函数一文件）。"""
     count = 0
@@ -249,6 +289,8 @@ def main():
                     help="prescreen 用的 build 目录（--prescreen 时必需）")
     ap.add_argument("--max-functions", type=int, default=0,
                     help="最多处理 N 个函数（0=全部）")
+    ap.add_argument("--no-sort", action="store_true",
+                    help="不按被调次数排序（默认优先修高频被调函数）")
     ap.add_argument("--model", default=None,
                     help="快模型（默认 deepseek-chat）")
     ap.add_argument("--slow-model", default=None,
@@ -296,6 +338,9 @@ def main():
         suspicious = prescreen_errors(args.build_dir)
         funcs = [f for f in funcs if f.getName() in suspicious]
 
+    if not args.no_sort:
+        funcs = sort_by_call_reference_count(program, funcs)
+
     if args.max_functions and args.max_functions > 0:
         funcs = funcs[:args.max_functions]
     LOG.info("待处理函数数: %d（锚点数 %d）", len(funcs), len(anchors))
@@ -332,6 +377,9 @@ def main():
             if ok:
                 ok_count += 1
                 changed.append(func)
+                # 锚点回流：修好的函数加入 anchors，后续函数调用它时可做
+                # 多层类型传播（第一轮只有 libc 锚点，这里逐层扩充）。
+                anchors[func.getName()] = param_type_names(params)
                 LOG.info("[%d/%d] %s: %s -> %s %s(%s)",
                          i, len(funcs), name, current_sig, ret, name, ", ".join(params))
             else:

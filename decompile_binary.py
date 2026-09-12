@@ -32,6 +32,7 @@ import json
 import logging
 import multiprocessing
 import os
+import re
 import signal
 import sys
 import threading
@@ -359,6 +360,26 @@ LIBC_TYPE_TARGETS = [
 ]
 
 
+_GLIBC_ALIAS_PREFIX_RE = re.compile(
+    r"^(?:__isoc\d+_|__GI_|__libc_|__builtin_|__ieee754_|__new_)"
+)
+_GLIBC_VERSION_SUFFIX_RE = re.compile(r"@.*$")
+
+
+def _normalize_libc_name(name):
+    """Normalize a glibc-internal alias/variant name back to the standard libc
+    name used in generic_clib_64.gdt.
+
+    Static linking pulls in libc objects whose symbols carry GCC/glibc alias
+    prefixes (``__isoc99_sscanf``, ``__GI_strlen``, ``__ieee754_sqrt@GLIBC_x``)
+    that never match the archive's plain names, so those functions keep their
+    fuzzy Ghidra signatures. Stripping the prefix lets us still inject the
+    exact signature from the archive.
+    """
+    n = _GLIBC_VERSION_SUFFIX_RE.sub("", name)
+    return _GLIBC_ALIAS_PREFIX_RE.sub("", n)
+
+
 def _import_libc_signatures(program, adtm) -> int:
     """Import libc function signatures from the archive into same-named
     functions in the program (statically-linked libc copies)."""
@@ -372,10 +393,14 @@ def _import_libc_signatures(program, adtm) -> int:
 
     func_mgr = program.getFunctionManager()
     func_by_name = {}
+    func_by_norm = {}
     for f in func_mgr.getFunctions(True):
         n = f.getName()
         if n not in func_by_name:
             func_by_name[n] = f
+        norm = _normalize_libc_name(n)
+        if norm != n and norm not in func_by_name and norm not in func_by_norm:
+            func_by_norm[norm] = f
 
     parser = FunctionSignatureParser(program.getDataTypeManager(), None)
     sig_count = 0
@@ -386,6 +411,8 @@ def _import_libc_signatures(program, adtm) -> int:
                 continue
             name = dt.getName()
             func = func_by_name.get(name)
+            if func is None:
+                func = func_by_norm.get(name)
             if func is None:
                 continue
             proto = dt.getPrototypeString()
@@ -455,11 +482,145 @@ def import_libc_types(program) -> int:
     finally:
         adtm.close()
 
+    named_count = _import_named_signatures(program)
+
     logging.info(
-        "Imported %d libc type(s), %d libc signature(s) from generic_clib_64.gdt.",
-        imported, sig_count,
+        "Imported %d libc type(s), %d libc signature(s) from generic_clib_64.gdt, "
+        "%d named-signature(s) from the builtin name table.",
+        imported, sig_count, named_count,
     )
     return imported
+
+
+# --------------------------------------------------------------------------- #
+# 名字 → 签名模板：为「非 libc 的内部库函数」注入精确签名
+# --------------------------------------------------------------------------- #
+# generic_clib_64.gdt 只覆盖标准 libc。静态链接二进制（或任何带内部工具库的
+# 程序）里还有一批名字语义固定、跨项目通用的函数（xmalloc/xfree 系列、
+# full_read/full_write 系列、strto* 包装……），Ghidra 对它们只能给出模糊签名
+# （参数个数猜错 → 所有调用者报 too few/many）。这里按名字直接注入精确签名，
+# 把它们变成类型传播的锚点。
+#
+# 每一项: (name 正则 fullmatch, 返回类型, 参数列表)。类型只用 Ghidra C
+# parser 确定能解析的基础类型（int/long/char */void */…，不用 const/typedef）。
+#
+# 注意：这里只放「跨项目通用」的命名。项目特有的内部库函数（如 busybox 的
+# bb_*）放 PROJECT_SIGNATURE_TABLES，通过 GHIDRA_SIG_PROJECTS 环境变量选择
+# 加载，避免污染通用默认。
+NAME_SIGNATURE_TABLE = [
+    # --- 通用 malloc/字符串包装（几乎每个 C 项目都有） ---
+    (r"xmalloc", "void *", ["unsigned long size"]),
+    (r"xcalloc", "void *", ["unsigned long nmemb", "unsigned long size"]),
+    (r"xrealloc", "void *", ["void *ptr", "unsigned long size"]),
+    (r"xfree", "void", ["void *ptr"]),
+    (r"xstrdup", "char *", ["char *s"]),
+    (r"xstrndup", "char *", ["char *s", "unsigned long n"]),
+    (r"xmemdup", "void *", ["void *p", "unsigned long n"]),
+    # --- 通用 fd 读写包装 ---
+    (r"full_write", "int", ["int fd", "void *buf", "int len"]),
+    (r"full_read", "int", ["int fd", "void *buf", "int len"]),
+    (r"xwrite", "int", ["int fd", "void *buf", "int len"]),
+    (r"xread", "int", ["int fd", "void *buf", "int len"]),
+    (r"xopen", "int", ["char *path", "int flags"]),
+    (r"xopen3", "int", ["char *path", "int flags", "int mode"]),
+    (r"xclose", "void", ["int fd"]),
+]
+
+# 项目特有的内部库函数签名表（可选加载）。通过 GHIDRA_SIG_PROJECTS=busybox 这类
+# 环境变量（逗号分隔）启用。按项目沉淀自己的内部库（busybox libbb、openssl 内部
+# 等），与通用默认表解耦。
+PROJECT_SIGNATURE_TABLES = {
+    "busybox": [
+        # strto* 语义包装
+        (r"bb_strtou", "unsigned long", ["char *arg", "char **endp", "int base"]),
+        (r"bb_strtoll", "long long", ["char *arg", "char **endp", "int base"]),
+        (r"bb_strtoull", "unsigned long long", ["char *arg", "char **endp", "int base"]),
+        # 信号处理包装
+        (r"bb_signals", "int", ["int sigs", "void *handler"]),
+        (r"bb_signals_norestart", "int", ["int sigs", "void *handler"]),
+    ],
+}
+
+
+def _signature_tables(projects=None):
+    """返回参与匹配的表列表：通用表 + 指定项目表。"""
+    tables = [NAME_SIGNATURE_TABLE]
+    if projects:
+        for proj in projects:
+            extra = PROJECT_SIGNATURE_TABLES.get(proj)
+            if extra is not None:
+                tables.append(extra)
+    return tables
+
+
+def match_name_signature(name, projects=None):
+    """Match *name* against the name→signature tables (generic + optional
+    project tables).
+
+    Returns ``(ret, params)`` or ``None``. Pure function (no Ghidra JVM needed).
+    """
+    for table in _signature_tables(projects):
+        for pattern, ret, params in table:
+            if re.fullmatch(pattern, name):
+                return ret, list(params)
+    return None
+
+
+def _apply_signature_to_func(program, parser, func, ret, params) -> bool:
+    """Apply a signature (ret + param strings) to *func* via Ghidra's
+    FunctionSignatureParser + ApplyFunctionSignatureCmd. Returns success."""
+    from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
+    from ghidra.program.model.symbol import SourceType
+
+    sig_str = "%s %s(%s)" % (ret, func.getName(), ", ".join(params))
+    try:
+        parsed = parser.parse(None, sig_str)
+    except Exception:
+        return False
+    if parsed is None:
+        return False
+    cmd = ApplyFunctionSignatureCmd(
+        func.getEntryPoint(), parsed, SourceType.USER_DEFINED, False, True
+    )
+    return bool(cmd.applyTo(program))
+
+
+def _import_named_signatures(program, projects=None) -> int:
+    """Inject precise signatures for functions whose names match the name→signature
+    tables (generic + optional project tables). Returns count applied.
+
+    *projects* defaults to the ``GHIDRA_SIG_PROJECTS`` env var (comma-separated).
+    """
+    if projects is None:
+        env = os.environ.get("GHIDRA_SIG_PROJECTS", "")
+        projects = [p.strip() for p in env.split(",") if p.strip()] or None
+    try:
+        from ghidra.app.util.parser import FunctionSignatureParser
+    except Exception as e:
+        logging.debug("named signature import unavailable: %s", e)
+        return 0
+
+    func_mgr = program.getFunctionManager()
+    func_by_name = {}
+    for f in func_mgr.getFunctions(True):
+        n = f.getName()
+        if n not in func_by_name:
+            func_by_name[n] = f
+
+    parser = FunctionSignatureParser(program.getDataTypeManager(), None)
+    applied = 0
+    tx = program.startTransaction("import named signatures")
+    try:
+        for name, func in func_by_name.items():
+            match = match_name_signature(name, projects=projects)
+            if match is None:
+                continue
+            ret, params = match
+            if _apply_signature_to_func(program, parser, func, ret, params):
+                applied += 1
+    finally:
+        program.endTransaction(tx, True)
+    return applied
 
 
 def load_binary(

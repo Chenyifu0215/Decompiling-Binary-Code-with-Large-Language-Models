@@ -1,26 +1,5 @@
-# ===== 第三方工具 / 运行环境（不随仓库上传）=====
-ghidra12.1/
-pyghidra_env/
-
-# ===== 本地配置 =====
-.claude/
-
-# ===== 测试数据集 / 反编译产物（不入库）=====
-tests/
-decomp_out/
-decomp_build/
-
-# ===== 工作日志 =====
-error.md
-
-# ===== 个人资料 / 冗余文件 =====
-陈俊佚*.pdf
-8维测试用例.zip
-
-# ===== Python =====
 __pycache__/
 *.pyc
-
-# ===== 系统文件 =====
-.DS_Store
-Thumbs.db
+*.pyo
+*.bak
+_test_tmp/

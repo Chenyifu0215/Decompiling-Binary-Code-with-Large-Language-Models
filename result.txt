@@ -1,0 +1,88 @@
+================================================================================
+Ghidra 静态反编译修复工程 - 各阶段成果 (result.txt)
+================================================================================
+
+一、测试对象
+--------------------------------------------------------------------------------
+  busybox_unstripped（静态链接 + unstripped ELF，x86-64）
+  - 5245 个函数（含内联 libc）；--map 过滤后保留 2655 个自有函数
+  - 编译：WSL gcc（-w，-include ghidra_types.h / compat.h / prototypes / globals）
+
+二、各阶段成果（编译错误数）
+--------------------------------------------------------------------------------
+  阶段                              错误数    说明
+  -------------------------------  ------   ----------------------------------
+  基线 v4                            4240   原始反编译（无优化）
+  签名注入                           4023   libc 别名去前缀 + 名字语义表
+  第一轮 LLM 签名修复                 2942   563 函数成功
+  typedef 沉淀                       2539   servent/tms/rlimit 等 + include
+  语法规则沉淀                        2423   冲突结构体声明 + 签名分行
+  LLM 类型修复（fix_types）           2141   补丁目录匹配修复后
+  全局变量用法推断                    1629   解引用->指针、位运算->整数
+  DAT_ 可写推断                      1406   被赋值的 DAT_x 声明为指针
+  intN/uintN typedef                 1360   int3..int7 / uint3..uint7
+  数组赋值修复                        1159   arr = expr -> *(undefined8 *)arr = expr
+  符号表反查 + 简单规则（干净重建）     1066   intN/签名分行/全局数组赋值/符号表反查
+  fix_undeclared（错误驱动补声明）      949   函数指针/数据常量/类型（-117）
+
+三、最终状态
+--------------------------------------------------------------------------------
+  错误数：949（基线 4240，-77.6%）
+  成功编译：2242 / 2655（84.4%）
+  测试：61 passed
+
+  最终错误分布：
+    too few/many（签名）        483
+    expected 系列                90
+    undeclared                   57
+    invalid use of void          54
+    conflicting types            43
+    assignment to array type     33
+    pointers/case values         32
+    invalid operands to binary   26
+    invalid type argument         5
+    其他                        ~126
+
+四、通用优化清单（全部可重现，非 busybox 特例）
+--------------------------------------------------------------------------------
+  优化                                          位置                层级
+  --------------------------------------------  ------------------  ----------------
+  libc 别名去前缀(__isoc*/__GI*/__ieee754*)      decompile_binary.py GCC/glibc 通用
+  名字语义签名表(xmalloc/full_read 等)           decompile_binary.py 常见命名约定
+  libc 类型导入(generic_clib_64.gdt)             decompile_binary.py POSIX 通用
+  typedef 沉淀(stat/dirent/servent/tms 等)       decompile_helper.py POSIX 通用
+  语法规则(冲突结构体、签名分行)                  decompile_helper.py Ghidra 通用
+  全局变量用法推断                                decompile_helper.py Ghidra 通用
+  DAT_ 可写推断                                  decompile_helper.py Ghidra 通用
+  数组赋值改写                                    decompile_helper.py Ghidra 通用
+  符号表规范化反查(dot.0->dot_0)                 decompile_helper.py ELF/Ghidra 通用
+  LLM 签名/类型修复                              fix_*_llm.py        通用
+  错误驱动补全未声明符号                          fix_undeclared.py   通用
+  唯一特例(bb_* 签名表，默认关闭)                 decompile_binary.py 已隔离
+
+五、关键技术结论
+--------------------------------------------------------------------------------
+  1.【硬边界】整二进制「完整重编译通过」在无源码下 ~0%（业界共识）。
+    int vs 指针 vs 结构体的类型信息在机器码里物理丢失。
+  2.【全局变量类型是最大源头】globals.h 里按数据段大小猜的类型
+    （size==8 -> long、size>8 -> 数组）导致 array type / unary / binary
+    大量错误；改为按代码真实用法推断后消除约 1000 条。
+  3.【用法推断优于大小猜测】按 *var（解引用）/ var & mask（位运算）/
+    &var（取地址）推断类型，完全通用（不依赖名字）。
+  4.【符号表规范化】Ghidra 把符号名里非标识符字符换成 "_"
+    （ELF 的 dot.0 -> Ghidra 标识符 dot_0），可反查恢复声明。
+  5.【stripped 降级】符号表反查 / 名字语义表依赖符号名，stripped 二进制
+    失效；但用法推断 / slice / 数组赋值等不依赖名字的优化仍有效。
+  6.【LLM 梯度】deepseek-chat 签名推断 ~0.5s/函数；签名迭代非单调，
+    多轮可能负收益（需验证回退机制）。
+  7.【静态 vs 动态链接】静态链接把 libc 内联成内部函数（名字带 glibc
+    前缀），需别名去前缀匹配签名；动态链接有导入表可直接注入。
+
+六、已知边界 / 未完成
+--------------------------------------------------------------------------------
+  - 跳转表（UNRECOVERED_JUMPTABLE）：Ghidra 输出 switchD_x::switchdataD_y
+    （C++ 风格 ::），C 编译报 expected ';' before '::'。
+  - stripped 二进制：符号名缺失，依赖名字的优化退化。
+  - 结构体字段语义名、int 有符号性：机器码物理丢失。
+  - 剩余 too few/many（483）：变参/复杂签名，LLM 推断已达天花板。
+  - 功能正确性（运行时行为）未系统验证，仅做了函数级 demo。
