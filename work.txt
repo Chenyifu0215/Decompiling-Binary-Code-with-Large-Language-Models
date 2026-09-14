@@ -22,6 +22,7 @@ Ghidra 静态反编译修复工程 - 使用说明 (work.txt)
   fix_signatures_llm.py   LLM 签名修复（证据包 -> LLM 推断签名 -> 回灌 Ghidra）
   fix_types_llm.py        LLM 类型/结构体错误修复（生成补丁修 .c 文件）
   fix_undeclared.py       错误驱动补全未声明符号（函数/数据，读编译 log）
+  fix_argcount.py         从调用点推断正确参数数，修正函数声明/定义
   fix_signatures.py       签名修复基础版（按 sigs.json 手工指定）
   orchestrator.py         静态编译修复闭环（fallback 规则库 / LLM 补丁）
   llm.py                  LLM proposer 模块（DeepSeek 调用 + fallback 规则库）
@@ -69,7 +70,10 @@ Ghidra 静态反编译修复工程 - 使用说明 (work.txt)
   # 6. 错误驱动补全未声明符号（可重复执行直到 undeclared 收敛）
   python fix_undeclared.py <binary> <work>/<stem>_build
 
-  # 7. 编译统计
+  # 7. 从调用点推断参数数，修正函数声明/定义（收敛 too few/many）
+  python fix_argcount.py <work>/<stem>_build
+
+  # 8. 编译统计
   wsl make -k -C <work>/<stem>_build -j
 
 五、各脚本详细用法
@@ -150,6 +154,17 @@ Ghidra 静态反编译修复工程 - 使用说明 (work.txt)
     - 查不到                  -> 追加 `extern undefined8 name;` 兜底
   可重复执行（每次基于最新编译 log），直到 undeclared 收敛。
   实测：busybox 1066 -> 949（-117）。
+
+■ fix_argcount.py —— 从调用点推断参数数
+    python fix_argcount.py <build_dir> [--min-votes N] [--dry-run]
+
+  原理：GCC 报 too few/many arguments 说明「声明参数数」与「调用点实际参数数」
+  不一致。统计每个被调函数在所有调用点的参数数分布，若众数占绝对多数
+  （>=90%，排除变参函数），则把 function_prototypes.h 和 .c 里的函数定义
+  改成该参数数（统一为 undefined8 param_N）。
+
+  --dry-run   只分析报告，不修改文件
+  实测：busybox 949 -> 875（-74），too few/many 483 -> 356。
 
 ■ orchestrator.py —— 静态修复闭环
     python orchestrator.py <binary> <decomp_dir> [options]
