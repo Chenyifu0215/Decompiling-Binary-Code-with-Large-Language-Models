@@ -25,22 +25,23 @@ Ghidra 静态反编译修复工程 - 各阶段成果 (result.txt)
   符号表反查 + 简单规则（干净重建）     1066   intN/签名分行/全局数组赋值/符号表反查
   fix_undeclared（错误驱动补声明）      949   函数指针/数据常量/类型（-117）
   fix_argcount（调用点推断参数数）       875   修正函数声明/定义参数个数（-74）
+  fix_argcount 改进（保留原参数类型）     852   消除 subscripted/unary 副作用（-23）
 
 三、最终状态
 --------------------------------------------------------------------------------
-  错误数：875（基线 4240，-79.4%）
-  成功编译：2262 / 2655（85.2%）
+  错误数：852（基线 4240，-79.9%）
+  成功编译：2259 / 2655（85.1%）
   测试：61 passed
 
   最终错误分布：
     too few/many（签名）        356
     expected 系列                90
     undeclared                   81
-    invalid use of void          54
-    conflicting types            43
-    assignment to array type     33
+    invalid use of void          55
+    conflicting types            42
+    assignment to array type     31
     invalid operands to binary   26
-    其他                        ~192
+    其他                        ~171
 
 四、通用优化清单（全部可重现，非 busybox 特例）
 --------------------------------------------------------------------------------

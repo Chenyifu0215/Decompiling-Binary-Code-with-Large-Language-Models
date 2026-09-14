@@ -89,15 +89,40 @@ def collect_arg_votes(build_dir, names):
     return votes
 
 
+def _strip_param_name(p):
+    """从 'long *param_1' 提取类型 'long *'；无参数名则原样返回。"""
+    p = p.strip()
+    m = re.match(r"^(.*?)\s*\b([A-Za-z_]\w*)\s*$", p)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+    return p
+
+
 def rewrite_params(text, name, nargs):
-    """只把「定义/声明行」里 name(...) 的参数列表换成 nargs 个 undefined8。"""
-    new_params = ", ".join("undefined8 param_%d" % (i + 1) for i in range(nargs))
+    """只把「定义/声明行」里 name(...) 调成 nargs 个参数。
+
+    保留已有参数的类型（只改个数），不足的补 undefined8——这样函数体里对
+    参数指针的索引/解引用不会因为类型被换成整数而报错。
+    """
     pat = re.compile(
         r"(?m)^((?:extern\s+)?[A-Za-z_][\w \*]*?\b" + re.escape(name) + r"\s*)"
-        r"\([^();]*\)")
+        r"\(([^();]*)\)")
 
     def repl(m):
-        return m.group(1) + "(" + new_params + ")"
+        prefix, params_str = m.group(1), m.group(2)
+        old_types = [_strip_param_name(p) for p in params_str.split(",") if p.strip()]
+        if old_types == ["void"]:
+            old_types = []
+        if nargs <= len(old_types):
+            types = old_types[:nargs]
+        else:
+            types = old_types + ["undefined8"] * (nargs - len(old_types))
+        if types:
+            new_params = ", ".join("%s param_%d" % (t, i + 1)
+                                   for i, t in enumerate(types))
+        else:
+            new_params = "void"
+        return prefix + "(" + new_params + ")"
 
     return pat.sub(repl, text)
 
