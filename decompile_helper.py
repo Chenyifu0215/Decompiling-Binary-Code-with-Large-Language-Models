@@ -1215,7 +1215,7 @@ def write_data_defs(binary, decomp_dir, out_path, files=None):
             continue
         if not raw:
             lines.append("/* DAT_%s: cannot map to file */" % hexstr)
-            lines.append("unsigned char DAT_%s[16] = {0};" % hexstr)
+            lines.append("const unsigned char DAT_%s[16] = {0};" % hexstr)
         elif is_str:
             lines.append('const char DAT_%s[] = "%s";' % (hexstr, escape_bytes(raw)))
         else:
@@ -1377,6 +1377,13 @@ def do_all(binary_path, decomp_dir, out_dir, map_path=None):
     if imported:
         name_by_path = {path: name for _, name, _, path in collect_functions(decomp_dir, kept)}
         kept = [p for p in kept if name_by_path.get(p, p.stem) not in imported]
+
+    # 清理输出目录里遗留的旧 .c（不在本次 kept 中的），避免上次运行生成、
+    # 这次已被过滤的文件残留在目录里（虽不进 Makefile 但污染输出）。
+    kept_names = {p.name for p in kept} | {"data_defs.c"}
+    for old in out_dir.glob("*.c"):
+        if old.name not in kept_names:
+            old.unlink()
 
     write_types(out_dir / "ghidra_types.h")
     write_compat(out_dir / "compat.h")

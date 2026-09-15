@@ -23,7 +23,8 @@ LOG = logging.getLogger("fix_binop")
 _ERR_RE = re.compile(
     r"^([A-Za-z0-9_./-]+\.c):(\d+):(\d+): error: invalid operands to binary")
 # 行内位运算：标识符 + 运算符（只 cast 简单标识符左操作数）
-_OP_RE = re.compile(r"\b([A-Za-z_]\w*)(\s*(?:>>|<<|&|\||\^)\s*)")
+_OP_RE = re.compile(
+    r"\b([A-Za-z_]\w*)(\s*(?:>>|<<|&|\||\^|\*|/|%)\s*)([A-Za-z_]\w*)")
 
 
 def compile_output(build_dir):
@@ -78,7 +79,7 @@ def main():
             if ln - 1 >= len(rows):
                 continue
             src = rows[ln - 1]
-            new = _OP_RE.sub(r"(unsigned long)\1\2", src)
+            new = _OP_RE.sub(r"(unsigned long)\1\2(unsigned long)\3", src)
             if new != src:
                 rows[ln - 1] = new
                 changed_lines += 1

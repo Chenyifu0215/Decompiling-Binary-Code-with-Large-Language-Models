@@ -178,10 +178,12 @@ def collect_functions(program, only_names=None, max_funcs=0):
 
 
 def _skip_name(name):
-    """排除 libc 内部（_ 开头）、GCC 冷路径/变体、匿名函数等噪声。"""
+    """排除 libc 内部（_ 开头）、GCC 冷路径/变体等噪声。
+
+    注意：不过滤 FUN_xxx——stripped 二进制里所有函数都是 FUN_xxx，
+    过滤会导致没有任何可修函数。
+    """
     if name.startswith("_"):
-        return True
-    if name.startswith("FUN_"):
         return True
     if ".cold" in name or ".isra" in name or ".constprop" in name or ".part" in name:
         return True
