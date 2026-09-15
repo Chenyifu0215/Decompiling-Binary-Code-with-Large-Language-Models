@@ -59,6 +59,8 @@ GHIDRA_TYPES_TEMPLATE = """#ifndef GHIDRA_TYPES_H
 #include <dirent.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <wchar.h>
+#include <langinfo.h>
 #include <netdb.h>
 #include <sys/times.h>
 #include <sys/resource.h>
@@ -583,12 +585,15 @@ def write_prototypes(decomp_dir, out_path, files=None, dup_names=None, binary=No
         "#define FUNCTION_PROTOTYPES_H",
         "",
     ]
+    imported = binary.get("imported", set()) if binary is not None else set()
     seen = set()
     for ret, name, params, path in collect_functions(decomp_dir, files):
         if should_skip(path):
             continue
         if name in seen:
             continue
+        if name in imported:
+            continue  # 动态导入的 libc 函数：声明由系统头提供
         if dup_names and name in dup_names:
             continue  # 同名函数不生成 extern 原型（各自文件内 static）
         seen.add(name)
@@ -609,6 +614,7 @@ SHT_SYMTAB = 2
 SHT_STRTAB = 3
 SHT_RELA = 4
 SHT_NOBITS = 8
+SHT_DYNSYM = 11
 SHF_ALLOC = 0x2
 ET_REL = 1
 ET_EXEC = 2
@@ -719,6 +725,29 @@ def parse_elf(path):
                 "size": st_size,
             })
 
+    # 动态导入符号（libc 等）：动态链接时其声明由系统头提供，
+    # decompile_helper 不应再生成 prototype/定义（否则与系统头 conflicting）。
+    imported = set()
+    dynsym = next((s for s in secs if s["type"] == SHT_DYNSYM), None)
+    if dynsym is not None and dynsym["link"] < len(secs):
+        dstr = secs[dynsym["link"]]
+        entsize = 24
+        count = dynsym["size"] // entsize
+        base = dynsym["offset"]
+        str_base = dstr["offset"]
+        for i in range(count):
+            o = base + i * entsize
+            if o + 24 > len(data):
+                break
+            st_name = struct.unpack_from("<I", data, o)[0]
+            st_shndx = struct.unpack_from("<H", data, o + 6)[0]
+            if st_shndx != 0:  # 只取 UND（导入）
+                continue
+            end = data.find(b"\x00", str_base + st_name)
+            name = data[str_base + st_name:end].decode("utf-8", "replace")
+            if name:
+                imported.add(name)
+
     # Globals: name -> (file_offset or None, size)
     globals_map = {}
     for sym in syms:
@@ -812,6 +841,7 @@ def parse_elf(path):
         "globals": globals_map,
         "norm_syms": norm_syms,
         "func_syms": func_syms,
+        "imported": imported,
         "pointer_size": 8,
         "resolve_pointer": resolve_pointer,
     }
@@ -1340,6 +1370,13 @@ def do_all(binary_path, decomp_dir, out_dir, map_path=None):
         kept_before = len(kept)
         kept = [p for p in kept if name_by_path.get(p, p.stem) in whitelist]
         filtered = kept_before - len(kept)
+
+    # 排除动态导入符号（libc 等）的反编译文件：其声明由系统头提供，
+    # 若参与编译会与系统头 conflicting（如 fscanf/fdopen/getenv）。
+    imported = binary.get("imported", set())
+    if imported:
+        name_by_path = {path: name for _, name, _, path in collect_functions(decomp_dir, kept)}
+        kept = [p for p in kept if name_by_path.get(p, p.stem) not in imported]
 
     write_types(out_dir / "ghidra_types.h")
     write_compat(out_dir / "compat.h")
