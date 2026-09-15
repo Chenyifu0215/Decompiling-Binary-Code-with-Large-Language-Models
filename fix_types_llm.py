@@ -29,6 +29,8 @@ TYPE_ERROR_PATTERNS = (
     "invalid operands to binary",
     "request for member",
     "invalid use of void expression",
+    "called object",        # 变量被当函数调用（声明类型错）
+    "subscripted value",    # 标量被下标（声明应为数组/指针）
 )
 
 
@@ -63,12 +65,29 @@ def parse_func_header(c_path):
     return name, addr
 
 
+def _compile_error_count(build_dir):
+    """make -k 编译，返回错误总数（用于验证回退）。"""
+    import platform
+    from orchestrator import parse_errors, to_wsl
+    make_cmd = (
+        ["wsl", "make", "-C", to_wsl(build_dir), "-k", "-j"]
+        if platform.system() == "Windows"
+        else ["make", "-C", str(build_dir), "-k", "-j"]
+    )
+    proc = subprocess.run(make_cmd, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    return sum(1 for e in parse_errors(output) if e.get("kind") == "error")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("binary")
     ap.add_argument("decomp_dir", help="反编译 .c 目录")
     ap.add_argument("--build-dir", required=True, help="build 目录")
     ap.add_argument("--max-functions", type=int, default=0)
+    ap.add_argument("--verify", action="store_true",
+                    help="修复后编译验证，错误总数增加则整体回退")
     ap.add_argument("--model", default=None)
     ap.add_argument("--slow-model", default=None)
     ap.add_argument("--base-url", default=None)
@@ -111,6 +130,11 @@ def main():
 
     decomp_dir = Path(args.decomp_dir)
     build_dir = Path(args.build_dir)
+
+    baseline = _compile_error_count(build_dir) if args.verify else None
+    if baseline is not None:
+        LOG.info("修复前错误数: %d", baseline)
+    backup = {}
 
     fixed = 0
     failed = 0
@@ -170,6 +194,11 @@ def main():
         for p in patches:
             if isinstance(p, dict):
                 p["file"] = fname
+        if args.verify:
+            for p in patches:
+                fp = build_dir / (p.get("file") or fname)
+                if str(fp) not in backup and fp.exists():
+                    backup[str(fp)] = fp.read_text(encoding="utf-8", errors="replace")
         applied, app_errs = apply_patch_list(str(build_dir), patches)
         if applied:
             fixed += 1
@@ -180,6 +209,16 @@ def main():
 
     LOG.info("类型修复完成：修复 %d，失败/跳过 %d（共处理 %d）",
              fixed, failed, processed)
+
+    if args.verify and baseline is not None and backup:
+        after = _compile_error_count(build_dir)
+        if after > baseline:
+            for fp_str, content in backup.items():
+                Path(fp_str).write_text(content, encoding="utf-8")
+            LOG.error("验证不通过：错误 %d -> %d，已回退 %d 个文件",
+                      baseline, after, len(backup))
+        else:
+            LOG.info("验证通过：错误 %d -> %d", baseline, after)
 
     decompiler.closeProgram()
     decompiler.dispose()

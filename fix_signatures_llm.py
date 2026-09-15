@@ -204,15 +204,18 @@ def prescreen_errors(build_dir):
     proc = subprocess.run(make_cmd, capture_output=True, text=True,
                           encoding="utf-8", errors="replace")
     output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    errs = parse_errors(output)
     names = set()
-    for e in parse_errors(output):
+    for e in errs:
         msg = e.get("message", "")
         if "too few arguments" in msg or "too many arguments" in msg:
             m = re.search(r"function\s+[‘’'`\"]?(\w+)", msg)
             if m:
                 names.add(m.group(1))
-    LOG.info("预筛出 %d 个 too few/many arguments 报错函数", len(names))
-    return names
+    error_count = sum(1 for e in errs if e.get("kind") == "error")
+    LOG.info("预筛出 %d 个 too few/many arguments 报错函数（总错误 %d）",
+             len(names), error_count)
+    return names, error_count
 
 
 def sort_by_call_reference_count(program, funcs):
@@ -278,6 +281,42 @@ def redecompile_selected(program, funcs, output_dir, decompiler):
     return count
 
 
+def _compile_error_count(build_dir):
+    """make -k 编译，返回错误总数（用于 --verify 验证回退）。"""
+    import platform
+    import subprocess
+    from orchestrator import parse_errors, to_wsl
+    make_cmd = (
+        ["wsl", "make", "-C", to_wsl(build_dir), "-k", "-j"]
+        if platform.system() == "Windows"
+        else ["make", "-C", str(build_dir), "-k", "-j"]
+    )
+    proc = subprocess.run(make_cmd, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    return sum(1 for e in parse_errors(output) if e.get("kind") == "error")
+
+
+def _rerun_tool_chain(binary, build_dir):
+    """重跑规则工具链（fix_conflicts/undeclared/argcount/binary_ops），
+    使验证时的编译口径与 baseline 一致（否则会因丢失工具修复而假阳性回退）。"""
+    import os
+    import subprocess
+    sd = Path(__file__).resolve().parent
+    env = dict(os.environ)
+    cmds = [
+        [sys.executable, str(sd / "fix_conflicts.py"), str(build_dir)],
+        [sys.executable, str(sd / "fix_undeclared.py"), binary, str(build_dir)],
+        [sys.executable, str(sd / "fix_argcount.py"), str(build_dir)],
+        [sys.executable, str(sd / "fix_binary_ops.py"), str(build_dir)],
+    ]
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, env=env, capture_output=True, timeout=3600)
+        except Exception as e:
+            LOG.debug("工具链 %s 失败: %s", Path(cmd[1]).name, e)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("binary")
@@ -293,6 +332,10 @@ def main():
                     help="最多处理 N 个函数（0=全部）")
     ap.add_argument("--no-sort", action="store_true",
                     help="不按被调次数排序（默认优先修高频被调函数）")
+    ap.add_argument("--verify", action="store_true",
+                    help="修复后重新生成工程并编译，错误总数增加则整体回退")
+    ap.add_argument("--map", default=None,
+                    help="GNU ld map 文件（--verify 时传给 decompile_helper）")
     ap.add_argument("--model", default=None,
                     help="快模型（默认 deepseek-chat）")
     ap.add_argument("--slow-model", default=None,
@@ -333,11 +376,12 @@ def main():
     funcs = [f for f in funcs
              if f.getName() not in anchors and not _skip_name(f.getName())]
 
+    baseline = None
     if args.prescreen:
         if not args.build_dir:
             LOG.error("--prescreen 需要 --build-dir")
             sys.exit(1)
-        suspicious = prescreen_errors(args.build_dir)
+        suspicious, baseline = prescreen_errors(args.build_dir)
         funcs = [f for f in funcs if f.getName() in suspicious]
 
     if not args.no_sort:
@@ -351,6 +395,7 @@ def main():
     fail_count = 0
     skip_count = 0
     changed = []
+    backup = {}
     try:
         for i, func in enumerate(funcs, 1):
             name = func.getName()
@@ -403,10 +448,34 @@ def main():
                     caller = fm.getFunctionContaining(ref.getFromAddress())
                     if caller is not None:
                         to_redecompile.add(caller)
+        if args.verify and args.build_dir:
+            for _f in to_redecompile:
+                _sname = "".join(c if c.isalnum() or c in "._-" else "_"
+                                 for c in _f.getName())
+                _fp = Path(args.output_dir) / (_sname + ".c")
+                if str(_fp) not in backup and _fp.exists():
+                    backup[str(_fp)] = _fp.read_text(encoding="utf-8", errors="replace")
         LOG.info("重新反编译 %d 个函数（被改 %d + 调用者）",
                  len(to_redecompile), len(changed))
         count = redecompile_selected(program, to_redecompile, args.output_dir, decompiler)
         LOG.info("已重新反编译 %d 个函数 -> %s", count, args.output_dir)
+
+    if args.verify and baseline is not None and backup and args.build_dir:
+        from orchestrator import prepare_build
+        try:
+            prepare_build(args.binary, args.output_dir, args.build_dir, args.map)
+        except Exception as e:
+            LOG.error("验证失败：decompile_helper 出错 %s", e)
+        else:
+            _rerun_tool_chain(args.binary, args.build_dir)
+            after = _compile_error_count(args.build_dir)
+            if after > baseline:
+                for _fp_str, _content in backup.items():
+                    Path(_fp_str).write_text(_content, encoding="utf-8")
+                LOG.error("验证不通过：错误 %d -> %d，已回退 %d 个文件",
+                          baseline, after, len(backup))
+            else:
+                LOG.info("验证通过：错误 %d -> %d", baseline, after)
 
     decompiler.closeProgram()
     decompiler.dispose()
