@@ -27,6 +27,16 @@ from pathlib import Path
 GHIDRA_TYPES_TEMPLATE = """#ifndef GHIDRA_TYPES_H
 #define GHIDRA_TYPES_H
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#ifndef _LARGEFILE64_SOURCE
+#define _LARGEFILE64_SOURCE
+#endif
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#endif
+
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -34,6 +44,34 @@ GHIDRA_TYPES_TEMPLATE = """#ifndef GHIDRA_TYPES_H
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/utsname.h>
+#include <sys/sysmacros.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <termios.h>
+#include <poll.h>
+#include <signal.h>
+#include <regex.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <wchar.h>
+#include <langinfo.h>
+#include <netdb.h>
+#include <sys/times.h>
+#include <sys/resource.h>
+#include <sys/uio.h>
+#include <sched.h>
+#include <sys/sysinfo.h>
+#include <netinet/ether.h>
+#include <setjmp.h>
+#include <glob.h>
+#include <sys/msg.h>
+#include <arpa/nameser.h>
 
 typedef unsigned char      undefined;
 typedef unsigned char      undefined1;
@@ -47,15 +85,77 @@ typedef unsigned long long undefined8;
 
 typedef signed char        sbyte;
 typedef unsigned char      byte;
+typedef unsigned char      uchar;
 typedef unsigned short     word;
 typedef unsigned short     ushort;
 typedef unsigned int       uint;
 typedef unsigned int       dword;
 typedef unsigned long      ulong;
 typedef unsigned long long ulonglong;
+typedef long long          longlong;
 typedef unsigned long long qword;
+typedef unsigned long long uint7;
+typedef int                int3;
+typedef unsigned int       uint3;
+typedef long long          int5;
+typedef unsigned long long uint5;
+typedef long long          int6;
+typedef unsigned long long uint6;
+typedef long long          int7;
 
-typedef void code(void);
+typedef undefined8 code();
+
+/* glibc / POSIX struct types (Ghidra emits them without the `struct` keyword).
+   `timezone` and `sigaction` are deliberately NOT typedef'd here: those
+   identifiers are already taken by a glibc global variable and a function
+   respectively. They are rewritten to `struct timezone` / `struct sigaction`
+   at code-generation time instead. */
+typedef struct tm tm;
+typedef struct termios termios;
+typedef struct in_addr in_addr;
+typedef struct utsname utsname;
+typedef struct sockaddr sockaddr;
+typedef struct timespec timespec;
+typedef struct timeval timeval;
+typedef struct pollfd pollfd;
+typedef struct dirent dirent;
+typedef struct servent servent;
+typedef struct hostent hostent;
+typedef struct addrinfo addrinfo;
+typedef struct tms tms;
+typedef struct rlimit rlimit;
+typedef struct rlimit64 rlimit64;
+typedef struct sched_param sched_param;
+typedef struct iovec iovec;
+typedef struct cmsghdr cmsghdr;
+typedef struct msghdr msghdr;
+typedef struct ether_addr ether_addr;
+typedef struct msqid_ds msqid_ds;
+typedef struct __jmp_buf_tag __jmp_buf_tag;
+
+/* Ghidra anonymous union (here: the `sa_handler` member of `struct sigaction`).
+   `sa_handler`/`sa_sigaction` are glibc macros expanding to
+   `__sigaction_handler.sa_handler`, so we must undef them while declaring the
+   union members, then restore them for the accessor expressions in the code. */
+#ifdef sa_handler
+#undef sa_handler
+#endif
+#ifdef sa_sigaction
+#undef sa_sigaction
+#endif
+typedef union {
+    unsigned long long _dummy;
+    struct {
+        void (*sa_handler)(int);
+        void (*sa_sigaction)(int, void *, void *);
+    } __sigaction_handler;
+} _union_1457;
+#define sa_handler __sigaction_handler.sa_handler
+#define sa_sigaction __sigaction_handler.sa_sigaction
+
+#ifndef ZEXT816
+#define ZEXT816(x) ((unsigned long long)(x) << 0x40)
+#endif
 
 #ifndef __isoc99_sscanf
 #define __isoc99_sscanf sscanf
@@ -151,21 +251,38 @@ def should_skip(path):
     return is_stub(path)
 
 
+def _strip_block_comments(text):
+    return re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+
+
 def parse_signature(text):
+    text = _strip_block_comments(text)
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("//"):
             continue
         m = re.match(r"^(.*?)\s+([\w.\-]+)\s*\((.*)\)\s*$", stripped)
         if m:
-            return m.group(1).strip(), m.group(2), m.group(3).strip()
+            ret = m.group(1).strip()
+            # Ghidra 的「数组指针」抽象声明符 `undefined1 (*) [16]` → `undefined1 *`
+            # （返回类型必须规范化：抽象声明符不是合法 C）。
+            ret = re.sub(r"\(\s*\*\s*\)\s*\[\s*\d+\s*\]", "*", ret)
+            ret = re.sub(r"\s*\[\s*\d+\s*\]", " *", ret)
+            ret = re.sub(r"\s+", " ", ret)
+            # 参数里的 `(*param_1) [16]` 是合法 C（且支持 param_1[i][j]），保留不动。
+            params = re.sub(r"\s+", " ", m.group(3).strip())
+            return ret, m.group(2), params
         break
     return None
 
 
-def collect_functions(decomp_dir):
+def _iter_files(decomp_dir, files):
+    return sorted(decomp_dir.glob("*.c")) if files is None else list(files)
+
+
+def collect_functions(decomp_dir, files=None):
     funcs = []
-    for path in sorted(decomp_dir.glob("*.c")):
+    for path in _iter_files(decomp_dir, files):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -175,6 +292,279 @@ def collect_functions(decomp_dir):
             continue
         funcs.append((sig[0], sig[1], sig[2], path))
     return funcs
+
+
+def find_dup_names(decomp_dir, files=None):
+    """找出同名函数（不同模块的 static 同名函数，反编译后被展平成全局同名）。"""
+    counts = {}
+    for ret, name, params, path in collect_functions(decomp_dir, files):
+        counts[name] = counts.get(name, 0) + 1
+    return {n for n, c in counts.items() if c > 1}
+
+
+def find_value_used_voids(decomp_dir, files=None):
+    """Names of functions decompiled as void/undefined whose return value is
+    actually consumed by a caller (assigned or returned)."""
+    ret_by_name = {}
+    for ret, name, params, path in collect_functions(decomp_dir, files):
+        ret_by_name[name] = ret
+    value_used = set()
+    for path in _iter_files(decomp_dir, files):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in re.finditer(r"(?:=\s*|return\s+)([A-Za-z_]\w*)\s*\(", text):
+            name = m.group(1)
+            if ret_by_name.get(name) in ("void", "undefined"):
+                value_used.add(name)
+    return value_used
+
+
+_SLICE_SIZE_TYPE = {
+    1: "undefined1",
+    2: "undefined2",
+    4: "undefined4",
+    8: "undefined8",
+}
+
+
+def _repair_slice_syntax(text):
+    def repl(m):
+        var, off, size = m.group(1), m.group(2), int(m.group(3))
+        t = _SLICE_SIZE_TYPE.get(size)
+        if t is None:
+            return m.group(0)
+        return "*(%s *)((char *)%s + %s)" % (t, var, off)
+
+    return re.sub(r"\b([A-Za-z_]\w*)\._(\d+)_(\d+)_", repl, text)
+
+
+# Ghidra 有时把「数组返回类型」单独放一行，函数名在下一行（中间空行）：
+#     undefined1  [16]
+#
+#     bb_simplify_path(char *param_1, ...)
+# 这会让下面的签名行解析（要求返回类型+函数名同一行）失效，数组 [N] 也就
+# 无法转成指针。这里先把分行合并回同一行。
+_SPLIT_ARRAY_RETURN_RE = re.compile(
+    r"^([A-Za-z_]\w*\s+\[\s*\d+\s*\])\s*\n\s*\n(\s*[A-Za-z_]\w*\s*\()",
+    re.MULTILINE,
+)
+# Ghidra 也会把「函数名」和「参数列表」拆成两行（中间空行）：
+#     undefined1  [16] func_name
+#
+#               (undefined8 param_1, ...)
+_SPLIT_ARRAY_PARAMS_RE = re.compile(
+    r"^([A-Za-z_]\w*\s+\[\s*\d+\s*\]\s+[A-Za-z_]\w*)\s*\n\s*\n(\s*\([^();]*\))\s*$",
+    re.MULTILINE,
+)
+
+
+def _merge_split_array_return(text):
+    text = _SPLIT_ARRAY_RETURN_RE.sub(lambda m: m.group(1) + " " + m.group(2), text)
+    text = _SPLIT_ARRAY_PARAMS_RE.sub(lambda m: m.group(1) + m.group(2), text)
+    return text
+
+
+_STACK_REF = re.compile(r"\b(stack0x[0-9a-fA-F]+)\b")
+
+
+def _repair_stack_refs(text):
+    idents = sorted({m.group(1) for m in _STACK_REF.finditer(text)})
+    if not idents:
+        return text
+    decls = "\n".join("  undefined1 %s[8];" % i for i in idents)
+    idx = text.find("{")
+    if idx == -1:
+        return text
+    return text[:idx + 1] + "\n" + decls + text[idx + 1:]
+
+
+_CALL_RET = re.compile(
+    r"((?:\*\s*\([^()]*\)|[A-Za-z_]\w*)\s*\([^;]*\))\s*;\s*\n\s*return;"
+)
+
+
+def _return_last_call(text):
+    return _CALL_RET.sub(lambda m: "return %s;" % m.group(1), text, count=1)
+
+
+# Struct tags whose bare name collides with a POSIX function or global
+# (stat(), flock(), sigaction(), the `timezone` global, ...). Ghidra emits them
+# WITHOUT the `struct` keyword, and they cannot be typedef'd because the bare
+# identifier is already taken in the global namespace. They are emitted as
+# `struct X` instead.
+#
+# This set is finite: it is exactly the POSIX structs that share a name with a
+# same-named function or global. When a new collision shows up as
+#   error: unknown type name 'X'  /  error: 'X' redeclared as different kind
+# add it here (and make sure the relevant system header is included in
+# GHIDRA_TYPES_TEMPLATE).
+_STRUCT_TAG_REWRITES = {
+    "stat": "struct stat",
+    "stat64": "struct stat64",
+    "flock": "struct flock",
+    "sigaction": "struct sigaction",
+    "timezone": "struct timezone",
+    "statfs": "struct statfs",
+    "statfs64": "struct statfs64",
+    "statvfs": "struct statvfs",
+    "statvfs64": "struct statvfs64",
+    "dirent": "struct dirent",
+    "dirent64": "struct dirent64",
+    "sysinfo": "struct sysinfo",
+}
+
+
+def _rewrite_struct_types(s):
+    for k, v in _STRUCT_TAG_REWRITES.items():
+        s = re.sub(r"(?<!struct )\b%s\b" % re.escape(k), v, s)
+    return s
+
+
+def _repair_struct_casts(text):
+    for k in _STRUCT_TAG_REWRITES:
+        text = re.sub(r"\(%s\s*\*\)" % re.escape(k), "(struct %s *)" % k, text)
+    return text
+
+
+# Struct tags that are NOT also POSIX function names. These are safe to rewrite
+# globally (including local variable declarations like `dirent64 *p;`), unlike
+# `stat`/`flock`/`sigaction` where a bare `\bstat\b` would also match `stat()`.
+_NON_FUNCTION_STRUCT_TAGS = {
+    "dirent", "dirent64", "stat64", "statfs64", "statvfs64", "timezone",
+}
+
+
+def _repair_struct_decls(text):
+    for k in _NON_FUNCTION_STRUCT_TAGS:
+        text = re.sub(r"(?<!struct )\b%s\b" % re.escape(k), "struct %s" % k, text)
+    return text
+
+
+# 函数名冲突的结构体 tag（stat()/sigaction()/flock()/statfs()/statvfs()/sysinfo()），
+# 在函数体内的局部声明（`stat local_d0;`）也要改成 `struct stat`，但不能误伤
+# 同名函数调用 `stat(...)`。用负向前瞻排除后跟 `(` 的调用。
+_CONFLICTING_STRUCT_TAGS = {
+    "stat", "sigaction", "flock", "statfs", "statvfs", "sysinfo",
+}
+
+
+def _repair_conflicting_struct_decls(text):
+    for k in _CONFLICTING_STRUCT_TAGS:
+        text = re.sub(
+            r"(?<!struct )\b%s\b(?!\s*\()" % re.escape(k),
+            "struct %s" % k,
+            text,
+        )
+    return text
+
+
+_ARRAY_DECL_RE = re.compile(
+    r"\b(?:undefined\d*|signed char|unsigned char|char|byte|uchar|short|ushort|"
+    r"word|int|uint|long|ulong|dword|qword|longlong|ulonglong|size_t)"
+    r"\s+([A-Za-z_]\w*)\s*\[\s*\d*\s*\]"
+)
+_ARRAY_ASSIGN_RE = re.compile(r"^(\s*)([A-Za-z_]\w*)\s*=\s*([^=][^;]*);\s*$",
+                              re.MULTILINE)
+
+
+def _repair_array_assignments(text, extra_arrays=None):
+    """Ghidra 把数组变量当标量赋值（``arr = expr;``）→ ``*(undefined8 *)arr = expr;``。
+
+    局部数组（``undefined1 auVar8[16];`` 之类的向量返回临时变量）和传入的全局
+    数组都适用；``arr[i] = expr;`` 不受影响。
+    """
+    arr_vars = set(_ARRAY_DECL_RE.findall(text))
+    if extra_arrays:
+        arr_vars |= set(extra_arrays)
+    if not arr_vars:
+        return text
+
+    def repl(m):
+        indent, var, expr = m.group(1), m.group(2), m.group(3)
+        if var in arr_vars:
+            return "%s*(undefined8 *)%s = %s;" % (indent, var, expr)
+        return m.group(0)
+
+    return _ARRAY_ASSIGN_RE.sub(repl, text)
+
+
+def _repair_global_names(text, global_names):
+    """Ghidra prefixes some data symbols with `_` (e.g. `_bb_common_bufsiz1`);
+    map them back to the symbol-table name."""
+    if not global_names:
+        return text
+    for name in sorted(set(re.findall(r"\b_([A-Za-z_][A-Za-z0-9_]*)\b", text))):
+        if name in global_names:
+            text = re.sub(r"\b_%s\b" % re.escape(name), name, text)
+    return text
+
+
+# glibc-provided globals that Ghidra reconstructs (with wrong types) from the
+# statically linked copy; these must NOT be redefined or they clash with libc.
+LIBC_GLOBALS = {
+    "stdin", "stdout", "stderr", "optarg", "optind", "opterr", "optopt",
+    "environ", "__environ", "timezone", "tzname", "daylight",
+    "program_invocation_name", "program_invocation_short_name",
+    "h_errno", "getdate_err",
+}
+
+
+def repair_source_file(src_path, dst_path, value_used=None, global_names=None,
+                       dup_names=None, global_arrays=None):
+    if value_used is None:
+        value_used = find_value_used_voids(src_path.parent)
+    text = src_path.read_text(encoding="utf-8", errors="replace")
+    text = _strip_block_comments(text)
+    text = _merge_split_array_return(text)
+    text = _repair_slice_syntax(text)
+    text = _repair_stack_refs(text)
+    text = _repair_struct_casts(text)
+    text = _repair_struct_decls(text)
+    text = _repair_conflicting_struct_decls(text)
+    text = _repair_array_assignments(text, extra_arrays=global_arrays)
+    text = _repair_global_names(text, global_names)
+    lines = text.splitlines()
+
+    name = None
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+
+        m = re.match(r"^(.*?)\s+([\w.\-]+)\s*\((.*)\)\s*$", stripped)
+        if not m:
+            break
+
+        ret = m.group(1).strip()
+        # 数组指针抽象声明符 `undefined1 (*) [16]` → `undefined1 *`
+        # （返回类型必须规范化；参数保留 `(*p) [N]`，与 parse_signature 一致）
+        ret = re.sub(r"\(\s*\*\s*\)\s*\[\s*\d+\s*\]", "*", ret)
+        ret = re.sub(r"\s*\[\s*\d+\s*\]", " *", ret)
+        ret = re.sub(r"\s+", " ", ret)
+        ret = _rewrite_struct_types(ret)
+        params = _rewrite_struct_types(m.group(3).strip())
+        name = m.group(2)
+        if name in value_used and ret in ("void", "undefined"):
+            ret = "undefined8"
+        if dup_names and name in dup_names:
+            lines[idx] = f"static {ret} {name}({params})"
+        else:
+            lines[idx] = f"{ret} {name}({params})"
+        break
+
+    result = "\n".join(lines) + "\n"
+    if name in value_used:
+        result = _return_last_call(result)
+    # 内容不变时不重写，保留旧 mtime，使 make 增量编译只编译真正变化的文件
+    if dst_path.exists():
+        try:
+            if dst_path.read_text(encoding="utf-8", errors="replace") == result:
+                return
+        except OSError:
+            pass
+    dst_path.write_text(result, encoding="utf-8")
 
 
 def write_types(out_path):
@@ -187,20 +577,30 @@ def write_compat(out_path):
     return out_path
 
 
-def write_prototypes(decomp_dir, out_path):
+def write_prototypes(decomp_dir, out_path, files=None, dup_names=None, binary=None):
+    value_used = find_value_used_voids(decomp_dir, files)
     lines = [
         "/* Auto-generated by decompile_helper.py. */",
         "#ifndef FUNCTION_PROTOTYPES_H",
         "#define FUNCTION_PROTOTYPES_H",
         "",
     ]
+    imported = binary.get("imported", set()) if binary is not None else set()
     seen = set()
-    for ret, name, params, path in collect_functions(decomp_dir):
+    for ret, name, params, path in collect_functions(decomp_dir, files):
         if should_skip(path):
             continue
         if name in seen:
             continue
+        if name in imported:
+            continue  # 动态导入的 libc 函数：声明由系统头提供
+        if dup_names and name in dup_names:
+            continue  # 同名函数不生成 extern 原型（各自文件内 static）
         seen.add(name)
+        if name in value_used and ret in ("void", "undefined"):
+            ret = "undefined8"
+        ret = _rewrite_struct_types(ret)
+        params = _rewrite_struct_types(params)
         psig = f"extern {ret} {name}({params});"
         lines.append(psig)
     lines.append("")
@@ -209,64 +609,241 @@ def write_prototypes(decomp_dir, out_path):
     return out_path
 
 
+SHT_PROGBITS = 1
+SHT_SYMTAB = 2
+SHT_STRTAB = 3
+SHT_RELA = 4
+SHT_NOBITS = 8
+SHT_DYNSYM = 11
+SHF_ALLOC = 0x2
+ET_REL = 1
+ET_EXEC = 2
+ET_DYN = 3
+STT_OBJECT = 1
+STT_FUNC = 2
+
+
 def parse_elf(path):
     data = path.read_bytes()
     if data[:4] != b"\x7fELF" or data[4] != 2:
         return None
-    segments = []
-    phoff = struct.unpack_from("<Q", data, 0x20)[0]
-    phentsize = struct.unpack_from("<H", data, 0x36)[0]
-    phnum = struct.unpack_from("<H", data, 0x38)[0]
-    for i in range(phnum):
-        off = phoff + i * phentsize
-        p_type = struct.unpack_from("<I", data, off)[0]
-        p_offset = struct.unpack_from("<Q", data, off + 8)[0]
-        p_vaddr = struct.unpack_from("<Q", data, off + 16)[0]
-        p_filesz = struct.unpack_from("<Q", data, off + 32)[0]
-        if p_type == 1:
-            segments.append((p_vaddr, p_offset, p_filesz))
 
-    globals_map = {}
+    e_type = struct.unpack_from("<H", data, 0x10)[0]
     shoff = struct.unpack_from("<Q", data, 0x28)[0]
     shentsize = struct.unpack_from("<H", data, 0x3A)[0]
     shnum = struct.unpack_from("<H", data, 0x3C)[0]
-    sections = []
+    shstrndx = struct.unpack_from("<H", data, 0x3E)[0]
+
+    secs = []
     for i in range(shnum):
         o = shoff + i * shentsize
-        sh_type = struct.unpack_from("<I", data, o + 4)[0]
-        sh_offset = struct.unpack_from("<Q", data, o + 0x18)[0]
-        sh_size = struct.unpack_from("<Q", data, o + 0x20)[0]
-        sh_link = struct.unpack_from("<I", data, o + 0x28)[0]
-        sh_entsize = struct.unpack_from("<Q", data, o + 0x38)[0]
-        sections.append((sh_type, sh_offset, sh_size, sh_link, sh_entsize))
-    for sh_type, sh_offset, sh_size, sh_link, sh_entsize in sections:
-        if sh_type == 2:
-            str_off = sections[sh_link][1]
-            count = sh_size // sh_entsize
-            for i in range(count):
-                o = sh_offset + i * sh_entsize
-                st_name, st_info = struct.unpack_from("<IB", data, o)
-                st_value, st_size = struct.unpack_from("<QQ", data, o + 8)
-                if (st_info & 0xF) != 1:
-                    continue
-                end = data.find(b"\x00", str_off + st_name)
-                name = data[str_off + st_name:end].decode("utf-8", "replace")
-                if not name or name.startswith("_") or "@" in name or "." in name:
-                    continue
-                globals_map[name] = (st_value, st_size)
+        if o + 64 > len(data):
             break
+        secs.append({
+            "name_off": struct.unpack_from("<I", data, o)[0],
+            "type": struct.unpack_from("<I", data, o + 4)[0],
+            "flags": struct.unpack_from("<Q", data, o + 8)[0],
+            "addr": struct.unpack_from("<Q", data, o + 16)[0],
+            "offset": struct.unpack_from("<Q", data, o + 24)[0],
+            "size": struct.unpack_from("<Q", data, o + 32)[0],
+            "link": struct.unpack_from("<I", data, o + 40)[0],
+            "info": struct.unpack_from("<I", data, o + 44)[0],
+            "align": struct.unpack_from("<Q", data, o + 48)[0],
+        })
+
+    # Program headers (executables / shared objects)
+    segments = []
+    if e_type in (ET_EXEC, ET_DYN):
+        phoff = struct.unpack_from("<Q", data, 0x20)[0]
+        phentsize = struct.unpack_from("<H", data, 0x36)[0]
+        phnum = struct.unpack_from("<H", data, 0x38)[0]
+        for i in range(phnum):
+            off = phoff + i * phentsize
+            if off + 56 > len(data):
+                break
+            p_type = struct.unpack_from("<I", data, off)[0]
+            p_offset = struct.unpack_from("<Q", data, off + 8)[0]
+            p_vaddr = struct.unpack_from("<Q", data, off + 16)[0]
+            p_filesz = struct.unpack_from("<Q", data, off + 32)[0]
+            if p_type == 1:
+                segments.append((p_vaddr, p_offset, p_filesz))
+
+    # Relocatable objects have no program headers; Ghidra lays allocatable
+    # sections out in order, aligned to their sh_addralign, from image base.
+    reloc_layout = []
+    if e_type == ET_REL:
+        image_base = 0x100000
+        va = image_base
+        for s in secs:
+            if s["type"] not in (SHT_PROGBITS, SHT_NOBITS):
+                continue
+            if not (s["flags"] & SHF_ALLOC):
+                continue
+            align = s["align"] or 1
+            va = (va + align - 1) & ~(align - 1)
+            reloc_layout.append((va, s["offset"], s["size"], s["type"]))
+            va += s["size"]
 
     def va_to_offset(va):
-        for vaddr, offset, filesz in segments:
-            if vaddr <= va < vaddr + filesz:
-                return offset + (va - vaddr)
+        if e_type in (ET_EXEC, ET_DYN):
+            for vaddr, offset, filesz in segments:
+                if vaddr <= va < vaddr + filesz:
+                    return offset + (va - vaddr)
+        else:
+            for gva, offset, size, stype in reloc_layout:
+                if gva <= va < gva + size:
+                    if stype == SHT_NOBITS:
+                        return None
+                    return offset + (va - gva)
         return None
+
+    # Symbol table
+    symtab = next((s for s in secs if s["type"] == SHT_SYMTAB), None)
+    strtab = secs[symtab["link"]] if symtab is not None and symtab["link"] < len(secs) else None
+
+    syms = []
+    if symtab is not None and strtab is not None:
+        entsize = 24
+        count = symtab["size"] // entsize
+        base = symtab["offset"]
+        str_base = strtab["offset"]
+        for i in range(count):
+            o = base + i * entsize
+            if o + 24 > len(data):
+                break
+            st_name = struct.unpack_from("<I", data, o)[0]
+            st_info = struct.unpack_from("<B", data, o + 4)[0]
+            st_shndx = struct.unpack_from("<H", data, o + 6)[0]
+            st_value = struct.unpack_from("<Q", data, o + 8)[0]
+            st_size = struct.unpack_from("<Q", data, o + 16)[0]
+            end = data.find(b"\x00", str_base + st_name)
+            syms.append({
+                "name": data[str_base + st_name:end].decode("utf-8", "replace"),
+                "info": st_info,
+                "shndx": st_shndx,
+                "value": st_value,
+                "size": st_size,
+            })
+
+    # 动态导入符号（libc 等）：动态链接时其声明由系统头提供，
+    # decompile_helper 不应再生成 prototype/定义（否则与系统头 conflicting）。
+    imported = set()
+    dynsym = next((s for s in secs if s["type"] == SHT_DYNSYM), None)
+    if dynsym is not None and dynsym["link"] < len(secs):
+        dstr = secs[dynsym["link"]]
+        entsize = 24
+        count = dynsym["size"] // entsize
+        base = dynsym["offset"]
+        str_base = dstr["offset"]
+        for i in range(count):
+            o = base + i * entsize
+            if o + 24 > len(data):
+                break
+            st_name = struct.unpack_from("<I", data, o)[0]
+            st_shndx = struct.unpack_from("<H", data, o + 6)[0]
+            if st_shndx != 0:  # 只取 UND（导入）
+                continue
+            end = data.find(b"\x00", str_base + st_name)
+            name = data[str_base + st_name:end].decode("utf-8", "replace")
+            if name:
+                imported.add(name)
+
+    # Globals: name -> (file_offset or None, size)
+    globals_map = {}
+    for sym in syms:
+        if (sym["info"] & 0xF) != STT_OBJECT:
+            continue
+        name = sym["name"]
+        if not name or name.startswith("_") or "@" in name or "." in name:
+            continue
+        shndx = sym["shndx"]
+        if shndx == 0 or shndx >= len(secs):
+            continue
+        sec = secs[shndx]
+        if sec["type"] == SHT_NOBITS:
+            file_offset = None
+        elif e_type == ET_REL:
+            file_offset = sec["offset"] + sym["value"]
+        else:
+            file_offset = va_to_offset(sym["value"])
+        globals_map[name] = (file_offset, sym["size"])
+
+    # 规范化符号映射：Ghidra 把符号名里的非标识符字符替换成 "_"（ELF 的
+    # `dot.0` → Ghidra 标识符 `dot_0`）。globals_map 跳过了带 "."/"@"/"_"
+    # 开头的名字，这里规范化后仍可反查，用于给「被使用但未声明」的常量名
+    # （如 `&dot_0`）生成定义。
+    norm_syms = {}
+    for sym in syms:
+        name = sym["name"]
+        if not name or (sym["info"] & 0xF) != STT_OBJECT:
+            continue
+        norm = re.sub(r"[^A-Za-z0-9_]", "_", name)
+        if norm in globals_map or norm in norm_syms:
+            continue
+        shndx = sym["shndx"]
+        if shndx == 0 or shndx >= len(secs):
+            continue
+        sec = secs[shndx]
+        if sec["type"] == SHT_NOBITS:
+            file_offset = None
+        elif e_type == ET_REL:
+            file_offset = sec["offset"] + sym["value"]
+        else:
+            file_offset = va_to_offset(sym["value"])
+        norm_syms[norm] = (file_offset, sym["size"])
+
+    # 函数符号的规范化名字集合（Ghidra 常量里也有函数，如 fileAction）
+    func_syms = set()
+    for sym in syms:
+        name = sym["name"]
+        if not name or (sym["info"] & 0xF) != STT_FUNC:
+            continue
+        func_syms.add(re.sub(r"[^A-Za-z0-9_]", "_", name))
+
+    # Resolve pointer relocations (R_X86_64_64) for relocatable objects so that
+    # arrays of string pointers can be reconstructed from .data.
+    resolve_pointer = None
+    if e_type == ET_REL:
+        relocs = {}
+        for s in secs:
+            if s["type"] != SHT_RELA:
+                continue
+            tgt_sec = s["info"]
+            tgt_offset = secs[tgt_sec]["offset"] if tgt_sec < len(secs) else 0
+            entsize = 24
+            count = s["size"] // entsize
+            base = s["offset"]
+            for i in range(count):
+                o = base + i * entsize
+                if o + 24 > len(data):
+                    break
+                r_offset = struct.unpack_from("<Q", data, o)[0]
+                r_info = struct.unpack_from("<Q", data, o + 8)[0]
+                r_addend = struct.unpack_from("<q", data, o + 16)[0]
+                r_type = r_info & 0xFFFFFFFF
+                sym_idx = r_info >> 32
+                if r_type != 1:
+                    continue
+                target = None
+                if sym_idx < len(syms):
+                    sym = syms[sym_idx]
+                    if sym["shndx"] < len(secs):
+                        target = secs[sym["shndx"]]["offset"] + sym["value"] + r_addend
+                relocs[tgt_offset + r_offset] = target
+
+        def resolve_pointer(file_offset):
+            return relocs.get(file_offset)
 
     return {
         "kind": "elf",
         "data": data,
         "va_to_offset": va_to_offset,
         "globals": globals_map,
+        "norm_syms": norm_syms,
+        "func_syms": func_syms,
+        "imported": imported,
+        "pointer_size": 8,
+        "resolve_pointer": resolve_pointer,
     }
 
 
@@ -309,13 +886,14 @@ def parse_pe(path):
         "image_base": image_base,
         "va_to_offset": va_to_offset,
         "globals": {},
+        "pointer_size": 8 if magic == 0x20B else 4,
     }
 
 
-def collect_dat_refs(decomp_dir):
+def collect_dat_refs(decomp_dir, files=None):
     addrs = set()
     pattern = re.compile(r"\bDAT_([0-9a-fA-F]+)\b")
-    for path in decomp_dir.glob("*.c"):
+    for path in _iter_files(decomp_dir, files):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -325,10 +903,27 @@ def collect_dat_refs(decomp_dir):
     return sorted(addrs, key=lambda s: int(s, 16))
 
 
-def collect_used_names(decomp_dir):
+def collect_writable_dat_refs(decomp_dir, files=None):
+    """Collect `_DAT_xxxx` addresses. Ghidra names an unnamed *writable* global
+    at that address with a leading underscore (usually a field inside a big
+    buffer like `bb_common_bufsiz1`). These need a writable variable, not a
+    `const` array."""
+    addrs = set()
+    pattern = re.compile(r"\b_DAT_([0-9a-fA-F]+)\b")
+    for path in _iter_files(decomp_dir, files):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in pattern.finditer(text):
+            addrs.add(m.group(1).lower())
+    return sorted(addrs, key=lambda s: int(s, 16))
+
+
+def collect_used_names(decomp_dir, files=None):
     names = set()
     ident = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
-    for path in decomp_dir.glob("*.c"):
+    for path in _iter_files(decomp_dir, files):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -348,21 +943,125 @@ def escape_bytes(raw):
     return "".join(parts)
 
 
-def guess_global_type(name, size, used_text):
-    if re.search(r"\b" + re.escape(name) + r"\b\s*=\s*fopen", used_text) or \
-       re.search(r"\b" + re.escape(name) + r"\b\s*[!=]=\s*(stdin|stdout|stderr)", used_text):
-        return "FILE *%s" % name
-    if size >= 64:
-        return "char %s[0x%x]" % (name, size)
+def read_raw(binary, file_offset, size):
+    if file_offset is None or file_offset < 0:
+        return None
+    if file_offset + size > len(binary["data"]):
+        return None
+    return binary["data"][file_offset:file_offset + size]
+
+
+def is_array_usage(name, used_text):
+    if re.search(r"\*\s*\([^()]*\*\)\s*\(?\s*" + re.escape(name) + r"\b", used_text):
+        return True
+    if re.search(r"\b" + re.escape(name) + r"\._\d+_\d+_", used_text):
+        return True
+    return False
+
+
+def pointer_array_strings(binary, file_offset, size):
+    ptr_size = binary.get("pointer_size", 8)
+    if file_offset is None or size % ptr_size != 0:
+        return None
+    n = size // ptr_size
+    strings = []
+    for i in range(n):
+        off = pointer_target_offset(binary, file_offset + i * ptr_size)
+        if off is None or off >= len(binary["data"]):
+            return None
+        chunk = binary["data"][off:off + 512]
+        end = chunk.find(b"\x00")
+        raw = chunk if end == -1 else chunk[:end]
+        if not (raw and looks_like_string(raw)):
+            return None
+        strings.append(raw)
+    return strings
+
+
+def collect_global_usage(text):
+    """一次扫描全部反编译文本，统计每个标识符的用法次数。
+
+    Ghidra 对全局变量只按「数据段大小」猜类型（size==8 → long、size>8 → 数组），
+    忽略了代码里的真实用法。这里统计用法，供 global_info 推断真实类型：
+    被 ``*var`` 解引用 → 指针；被 ``var & mask`` 位运算 → 整数。
+    """
+    usage = {}
+
+    def bump(name, key):
+        u = usage.setdefault(
+            name, {"deref": 0, "bitop": 0, "index": 0, "assign": 0, "addr": 0})
+        u[key] += 1
+
+    # 解引用（*var，不含 *(...)、*var( 调用）
+    for m in re.finditer(r"\*\s*([A-Za-z_]\w*)\b", text):
+        bump(m.group(1), "deref")
+    # 位运算：var 作为左操作数（& | ^ << >>）
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*(?:[&|^]|<<|>>)(?![=&])", text):
+        bump(m.group(1), "bitop")
+    # 位运算：var 作为右操作数（| ^ << >>，不含 & 以免和取地址混淆）
+    for m in re.finditer(r"(?:[|^]|<<|>>)\s*([A-Za-z_]\w*)", text):
+        bump(m.group(1), "bitop")
+    # 索引 var[
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\[", text):
+        bump(m.group(1), "index")
+    # 赋值 var =（排除 ==）
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*=(?!=)", text):
+        bump(m.group(1), "assign")
+    # 取地址 &var
+    for m in re.finditer(r"&\s*([A-Za-z_]\w*)", text):
+        bump(m.group(1), "addr")
+    return usage
+
+
+def global_info(binary, name, file_offset, size, used_text, usage=None):
+    """Return (ctype, initializer_or_None) for a named global."""
+    ptr_size = binary.get("pointer_size", 8)
+
+    if size == ptr_size:
+        target = pointer_target_string(binary, file_offset)
+        if target is not None:
+            return ("char *%s" % name, '"%s"' % escape_bytes(target))
+
+    if size and size % ptr_size == 0:
+        strings = pointer_array_strings(binary, file_offset, size)
+        if strings is not None:
+            body = ", ".join('"%s"' % escape_bytes(s) for s in strings)
+            return ("char *%s[%d]" % (name, size // ptr_size), "{%s}" % body)
+
+    # 用法推断（优先于数组误判）：Ghidra 按数据段大小猜类型，slice 语法和指针
+    # 强转还会触发 is_array_usage 误判；代码里的真实用法才是判据。
+    if usage:
+        u = usage.get(name)
+        if u:
+            # 被解引用 → 指针（`*var` 要求 var 是指针）。deref 优先于 bitop：
+            # `*var & mask` 里的 `var &` 是解引用后的值做位运算，var 本身仍是指针。
+            if u["deref"] > 0:
+                return ("undefined8 *%s" % name, None)
+            # 位运算占主导（多于取地址/索引）→ 整数；取地址占主导的保持数组。
+            if u["bitop"] > 0 and u["bitop"] > u["addr"] + u["index"]:
+                return ("unsigned long %s" % name, None)
+
+    if is_array_usage(name, used_text) or size > ptr_size:
+        ctype = "unsigned char %s[0x%x]" % (name, size)
+        init = None
+        raw = read_raw(binary, file_offset, size)
+        if raw is not None:
+            body = ", ".join("0x%02x" % b for b in raw) or "0"
+            init = "{%s}" % body
+        return (ctype, init)
+
     if size == 8:
-        return "long %s" % name
+        return ("long %s" % name, None)
     if size == 4:
-        return "int %s" % name
+        init = None
+        if file_offset is not None and file_offset + 4 <= len(binary["data"]):
+            init = str(struct.unpack_from("<i", binary["data"], file_offset)[0])
+        return ("int %s" % name, init)
     if size == 2:
-        return "short %s" % name
+        return ("short %s" % name, None)
     if size == 1:
-        return "char %s" % name
-    return "unsigned char %s[0x%x]" % (name, size)
+        return ("char %s" % name, None)
+    return ("unsigned char %s[0x%x]" % (name, size), None)
 
 
 def looks_like_string(raw):
@@ -377,25 +1076,68 @@ def looks_like_string(raw):
     return True
 
 
-def referenced_globals(binary, decomp_dir):
+def read_pointer_value(binary, file_offset):
+    size = binary.get("pointer_size", 8)
+    if file_offset is None or file_offset < 0:
+        return None
+    if file_offset + size > len(binary["data"]):
+        return None
+
+    if size == 4:
+        return struct.unpack_from("<I", binary["data"], file_offset)[0]
+    if size == 8:
+        return struct.unpack_from("<Q", binary["data"], file_offset)[0]
+    return None
+
+
+def pointer_target_offset(binary, file_offset):
+    resolver = binary.get("resolve_pointer")
+    if resolver is not None:
+        off = resolver(file_offset)
+        if off is not None:
+            return off
+    value = read_pointer_value(binary, file_offset)
+    if value is None:
+        return None
+    return binary["va_to_offset"](value)
+
+
+def pointer_target_string(binary, file_offset):
+    off = pointer_target_offset(binary, file_offset)
+    if off is None or off >= len(binary["data"]):
+        return None
+
+    chunk = binary["data"][off:off + 512]
+    end = chunk.find(b"\x00")
+    raw = chunk if end == -1 else chunk[:end]
+    if raw and looks_like_string(raw):
+        return raw
+    return None
+
+
+def referenced_globals(binary, decomp_dir, files=None):
     used = " ".join(
         p.read_text(encoding="utf-8", errors="replace")
-        for p in decomp_dir.glob("*.c")
+        for p in _iter_files(decomp_dir, files)
     )
-    used_names = collect_used_names(decomp_dir)
+    usage = collect_global_usage(used)
+    used_names = collect_used_names(decomp_dir, files)
     result = []
-    for name, (addr, size) in sorted(binary["globals"].items()):
+    for name, (file_offset, size) in sorted(binary["globals"].items()):
         if name not in used_names:
             continue
-        result.append((name, addr, size, guess_global_type(name, size, used)))
+        if name in LIBC_GLOBALS:
+            continue
+        ctype, init = global_info(binary, name, file_offset, size, used, usage)
+        result.append((name, size, ctype, init))
     return result
 
 
-def dat_entries(binary, decomp_dir):
+def dat_entries(binary, decomp_dir, files=None):
     va_to_offset = binary["va_to_offset"]
     data = binary["data"]
     entries = []
-    for hexstr in collect_dat_refs(decomp_dir):
+    for hexstr in collect_dat_refs(decomp_dir, files):
         addr = int(hexstr, 16)
         off = va_to_offset(addr)
         if off is None or off >= len(data):
@@ -408,14 +1150,69 @@ def dat_entries(binary, decomp_dir):
     return entries
 
 
-def write_data_defs(binary, decomp_dir, out_path):
+def collect_amp_refs(decomp_dir, files=None):
+    """收集可能引用未声明符号的标识符：``&name``（取地址）和 ``name =``
+    （赋值形式，Ghidra 的 static/常量名如 ``_SL_`` 常以赋值出现）。"""
+    names = set()
+    for path in _iter_files(decomp_dir, files):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in re.finditer(r"&\s*([A-Za-z_]\w*)\b", text):
+            names.add(m.group(1))
+        for m in re.finditer(r"(?m)^\s*([A-Za-z_]\w*)\s*=(?!=)", text):
+            names.add(m.group(1))
+    return names
+
+
+def extra_globals(binary, decomp_dir, files=None):
+    """标准 globals 之外、可从符号表反查的常量（Ghidra 常量名如 ``&dot_0``）。
+
+    返回 ``[(name, size, file_offset)]``。
+    """
+    norm_syms = binary.get("norm_syms", {})
+    known = set(binary["globals"]) | LIBC_GLOBALS
+    result = []
+    for name in sorted(collect_amp_refs(decomp_dir, files)):
+        if name in known:
+            continue
+        sym = norm_syms.get(name)
+        if sym is None:
+            continue
+        result.append((name, sym[1], sym[0]))
+    return result
+
+
+def _global_usage(decomp_dir, files=None):
+    used = " ".join(
+        p.read_text(encoding="utf-8", errors="replace")
+        for p in _iter_files(decomp_dir, files)
+    )
+    return collect_global_usage(used)
+
+
+def _dat_writable(hexstr, usage):
+    """DAT_* 若在代码里被赋值/解引用/位运算，说明它是可写变量而非常量数据，
+    必须声明成指针/整数，否则 ``DAT_x = ...`` 会报 assignment to array type。"""
+    u = usage.get("DAT_" + hexstr)
+    return bool(u and (u["deref"] > 0 or u["bitop"] > 0 or u["assign"] > 0))
+
+
+def write_data_defs(binary, decomp_dir, out_path, files=None):
     lines = [
         "/* Auto-generated by decompile_helper.py. */",
         "#include \"ghidra_types.h\"",
         "",
     ]
 
-    for hexstr, is_str, raw in dat_entries(binary, decomp_dir):
+    usage = _global_usage(decomp_dir, files)
+    for hexstr, is_str, raw in dat_entries(binary, decomp_dir, files):
+        if _dat_writable(hexstr, usage):
+            lines.append("/* DAT_%s: writable (used as a variable) */" % hexstr)
+            lines.append("undefined8 *DAT_%s = 0;" % hexstr)
+            lines.append("")
+            continue
         if not raw:
             lines.append("/* DAT_%s: cannot map to file */" % hexstr)
             lines.append("unsigned char DAT_%s[16] = {0};" % hexstr)
@@ -426,16 +1223,35 @@ def write_data_defs(binary, decomp_dir, out_path):
             lines.append("const unsigned char DAT_%s[] = {%s};" % (hexstr, body))
         lines.append("")
 
-    for name, addr, size, decl in referenced_globals(binary, decomp_dir):
-        lines.append("/* %s @ 0x%x (0x%x bytes) */" % (name, addr, size))
-        lines.append("%s;" % decl)
+    for name, size, ctype, init in referenced_globals(binary, decomp_dir, files):
+        lines.append("/* %s (0x%x bytes) */" % (name, size))
+        if init is not None:
+            lines.append("%s = %s;" % (ctype, init))
+        else:
+            lines.append("%s;" % ctype)
+        lines.append("")
+
+    for hexstr in collect_writable_dat_refs(decomp_dir, files):
+        lines.append("/* writable unnamed global at 0x%s */" % hexstr)
+        lines.append("undefined8 *_DAT_%s;" % hexstr)
+        lines.append("")
+
+    for name, size, file_offset in extra_globals(binary, decomp_dir, files):
+        size = size or 16
+        raw = read_raw(binary, file_offset, size)
+        lines.append("/* %s (%d bytes, resolved via symbol table) */" % (name, size))
+        if raw is not None:
+            body = ", ".join("0x%02x" % b for b in raw) or "0"
+            lines.append("char %s[0x%x] = {%s};" % (name, size, body))
+        else:
+            lines.append("char %s[0x%x];" % (name, size))
         lines.append("")
 
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out_path
 
 
-def write_globals(binary, decomp_dir, out_path):
+def write_globals(binary, decomp_dir, out_path, files=None):
     lines = [
         "/* Auto-generated by decompile_helper.py. */",
         "#ifndef GLOBALS_H",
@@ -444,13 +1260,27 @@ def write_globals(binary, decomp_dir, out_path):
         "#include \"ghidra_types.h\"",
         "",
     ]
-    for name, addr, size, decl in referenced_globals(binary, decomp_dir):
-        lines.append("/* %s @ 0x%x */" % (name, addr))
-        lines.append("extern %s;" % decl)
+    for name, size, ctype, init in referenced_globals(binary, decomp_dir, files):
+        lines.append("/* %s (0x%x bytes) */" % (name, size))
+        lines.append("extern %s;" % ctype)
         lines.append("")
-    for hexstr, is_str, raw in dat_entries(binary, decomp_dir):
+    usage = _global_usage(decomp_dir, files)
+    for hexstr, is_str, raw in dat_entries(binary, decomp_dir, files):
+        if _dat_writable(hexstr, usage):
+            lines.append("extern undefined8 *DAT_%s;" % hexstr)
+            continue
         ctype = "const char" if is_str else "const unsigned char"
-        lines.append("extern %s DAT_%s[];" % (ctype, hexstr))
+        if is_str:
+            size = len(raw) + 1
+        elif raw:
+            size = len(raw)
+        else:
+            size = 16
+        lines.append("extern %s DAT_%s[%d];" % (ctype, hexstr, size))
+    for hexstr in collect_writable_dat_refs(decomp_dir, files):
+        lines.append("extern undefined8 *_DAT_%s;" % hexstr)
+    for name, size, _ in extra_globals(binary, decomp_dir, files):
+        lines.append("extern char %s[0x%x];" % (name, size or 16))
     lines.append("#endif")
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out_path
@@ -489,6 +1319,7 @@ def write_build_ps1(out_dir, c_files, exe_name):
         "  if ($_ -match '^(.*?)=(.*)$') { Set-Item -Path (\"env:\" + $matches[1]) -Value $matches[2] }",
         "}",
         "",
+        "New-Item -ItemType Directory -Force -Path obj | Out-Null",
         "$objs = @()",
     ]
     for f in c_files:
@@ -496,15 +1327,33 @@ def write_build_ps1(out_dir, c_files, exe_name):
         lines.append('if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }')
         lines.append('$objs += "obj\\%s.obj"' % Path(f).stem)
     lines += [
-        "New-Item -ItemType Directory -Force -Path obj | Out-Null",
-        "& link /nologo /out:%s $objs data_defs.obj" % exe_name,
+        "& link /nologo /out:%s $objs" % exe_name,
         "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
         'Write-Host "Built %s"' % exe_name,
     ]
     (out_dir / "build.ps1").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def do_all(binary_path, decomp_dir, out_dir):
+def parse_map_whitelist(map_path):
+    """Extract a self-owned function whitelist from a GNU ld map file.
+
+    Code built with -ffunction-sections gets one `.text.<name>` section per
+    function, while precompiled system libraries (libc/libm/libgcc) have no
+    per-function sections. Those section names are therefore exactly the set of
+    self-owned functions, useful to drop system-library code that was
+    statically linked into the binary.
+    """
+    funcs = set()
+    sec_re = re.compile(r"^\.text\.([A-Za-z_][A-Za-z0-9_.]*)$")
+    with open(map_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = sec_re.match(line.strip())
+            if m:
+                funcs.add(m.group(1))
+    return funcs
+
+
+def do_all(binary_path, decomp_dir, out_dir, map_path=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     binary = parse_elf(binary_path) or parse_pe(binary_path)
     if binary is None:
@@ -513,14 +1362,39 @@ def do_all(binary_path, decomp_dir, out_dir):
     kept = [p for p in sorted(decomp_dir.glob("*.c")) if not should_skip(p)]
     skipped = [p for p in sorted(decomp_dir.glob("*.c")) if should_skip(p)]
 
+    filtered = 0
+    if map_path:
+        whitelist = parse_map_whitelist(map_path)
+        # 用函数名（.c 文件签名里的名字）过滤，而非文件名（同名函数文件名含地址后缀）
+        name_by_path = {path: name for _, name, _, path in collect_functions(decomp_dir, kept)}
+        kept_before = len(kept)
+        kept = [p for p in kept if name_by_path.get(p, p.stem) in whitelist]
+        filtered = kept_before - len(kept)
+
+    # 排除动态导入符号（libc 等）的反编译文件：其声明由系统头提供，
+    # 若参与编译会与系统头 conflicting（如 fscanf/fdopen/getenv）。
+    imported = binary.get("imported", set())
+    if imported:
+        name_by_path = {path: name for _, name, _, path in collect_functions(decomp_dir, kept)}
+        kept = [p for p in kept if name_by_path.get(p, p.stem) not in imported]
+
     write_types(out_dir / "ghidra_types.h")
     write_compat(out_dir / "compat.h")
-    write_prototypes(decomp_dir, out_dir / "function_prototypes.h")
-    write_globals(binary, decomp_dir, out_dir / "globals.h")
-    write_data_defs(binary, decomp_dir, out_dir / "data_defs.c")
+    dup_names = find_dup_names(decomp_dir, kept)
+    write_prototypes(decomp_dir, out_dir / "function_prototypes.h", kept, dup_names, binary)
+    write_globals(binary, decomp_dir, out_dir / "globals.h", kept)
+    write_data_defs(binary, decomp_dir, out_dir / "data_defs.c", kept)
 
+    value_used = find_value_used_voids(decomp_dir, kept)
+    global_names = set(binary["globals"].keys())
+    # 数组形式的全局变量（globals.h 里以 name[N] 声明），供数组赋值修复规则使用
+    global_arrays = set()
+    gh_text = (out_dir / "globals.h").read_text(encoding="utf-8", errors="replace")
+    for m in re.finditer(r"extern\s+\S.*?\s+([A-Za-z_]\w*)\s*\[", gh_text):
+        global_arrays.add(m.group(1))
     for p in kept:
-        (out_dir / p.name).write_bytes(p.read_bytes())
+        repair_source_file(p, out_dir / p.name, value_used, global_names, dup_names,
+                           global_arrays)
 
     write_makefile(out_dir, [p.name for p in kept] + ["data_defs.c"], "rebuilt.exe")
     write_build_ps1(out_dir, [p.name for p in kept] + ["data_defs.c"], "rebuilt.exe")
@@ -528,6 +1402,8 @@ def do_all(binary_path, decomp_dir, out_dir):
     print("Output: %s" % out_dir)
     print("  kept functions:    %d" % len(kept))
     print("  skipped stubs:     %d" % len(skipped))
+    if filtered:
+        print("  filtered syslib:   %d" % filtered)
     print("  ghidra_types.h, compat.h, function_prototypes.h, globals.h, data_defs.c, Makefile, build.ps1")
 
     bad = []
@@ -570,6 +1446,9 @@ def main():
     p_all.add_argument("binary")
     p_all.add_argument("decomp_dir")
     p_all.add_argument("-o", "--output-dir", default=None)
+    p_all.add_argument("--map", default=None,
+                       help="GNU ld map file: keep only self-owned functions "
+                            "and drop statically-linked system-library code")
 
     args = parser.parse_args()
 
@@ -595,9 +1474,9 @@ def main():
         binary_path = Path(args.binary)
         decomp_dir = Path(args.decomp_dir)
         out_dir = Path(args.output_dir) if args.output_dir else Path(
-            "decomp_build" / ("%s_build" % binary_path.stem)
-        )
-        do_all(binary_path, decomp_dir, out_dir)
+            "decomp_build"
+        ) / ("%s_build" % binary_path.stem)
+        do_all(binary_path, decomp_dir, out_dir, map_path=args.map)
 
 
 if __name__ == "__main__":

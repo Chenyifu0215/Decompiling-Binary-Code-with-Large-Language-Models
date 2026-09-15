@@ -30,7 +30,9 @@ import concurrent.futures
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
+import re
 import signal
 import sys
 import threading
@@ -38,6 +40,7 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from queue import Empty
 from typing import Dict, List, Optional, Tuple, Union
 
 SCRIPT_VERSION = "2.0.0"
@@ -198,8 +201,11 @@ def find_ghidra_install() -> Optional[Path]:
     if env and Path(env).is_dir():
         return Path(env)
 
+    script_dir = Path(__file__).resolve().parent
+    project_dir = script_dir.parent
     candidates = [
-        Path(__file__).resolve().parent,
+        script_dir,
+        project_dir / "ignore" / "tools" / "ghidra12.1",
         Path.home() / "ghidra",
         Path("C:/ghidra") if sys.platform == "win32" else None,
         Path("/opt/ghidra"),
@@ -220,6 +226,7 @@ def start_ghidra(
     max_memory: Optional[str] = None,
 ):
     import pyghidra
+    from pyghidra.launcher import HeadlessPyGhidraLauncher
 
     install_dir = ghidra_dir or find_ghidra_install()
     if install_dir is None:
@@ -231,11 +238,20 @@ def start_ghidra(
     logging.info("Using Ghidra install: %s", install_dir)
 
     if not pyghidra.started():
-        kwargs = {"verbose": verbose, "install_dir": install_dir}
+        launcher = HeadlessPyGhidraLauncher(
+            verbose=verbose,
+            install_dir=install_dir,
+        )
+        launcher.add_vmargs("-Djava.awt.headless=true")
         if max_memory:
-            kwargs["vmargs"] = [f"-Xmx{max_memory}"]
-        launcher = pyghidra.start(**kwargs)
+            launcher.add_vmargs(f"-Xmx{max_memory}")
+        launcher.start()
         return launcher
+
+    if max_memory:
+        logging.warning(
+            "--max-memory ignored because the JVM is already running."
+        )
     return None
 
 
@@ -322,6 +338,294 @@ def get_output_paths(
     return per_file_dir, single_output
 
 
+LIBC_TYPE_TARGETS = [
+    ("stat.h", "stat"), ("stat.h", "stat64"),
+    ("dirent.h", "dirent"), ("dirent.h", "DIR"),
+    ("termios.h", "termios"), ("termios.h", "winsize"),
+    ("socket.h", "sockaddr"), ("socket.h", "sockaddr_storage"),
+    ("socket.h", "msghdr"), ("socket.h", "cmsghdr"),
+    ("in.h", "in_addr"), ("in.h", "in6_addr"),
+    ("in.h", "sockaddr_in"), ("in.h", "sockaddr_in6"),
+    ("un.h", "sockaddr_un"),
+    ("fcntl.h", "flock"),
+    ("sigaction.h", "sigaction"), ("signal.h", "sighandler_t"),
+    ("time.h", "timespec"), ("time.h", "timeval"),
+    ("time.h", "timezone"), ("time.h", "itimerval"), ("time.h", "itimerspec"),
+    ("utsname.h", "utsname"),
+    ("poll.h", "pollfd"),
+    ("regex.h", "regex_t"),
+    ("resource.h", "rusage"), ("resource.h", "rlimit"),
+    ("netdb.h", "hostent"), ("netdb.h", "servent"), ("netdb.h", "protoent"),
+    ("netdb.h", "addrinfo"),
+    ("ifaddrs.h", "ifaddrs"),
+    ("uio.h", "iovec"),
+    ("sched.h", "sched_param"),
+]
+
+
+_GLIBC_ALIAS_PREFIX_RE = re.compile(
+    r"^(?:__isoc\d+_|__GI_|__libc_|__builtin_|__ieee754_|__new_)"
+)
+_GLIBC_VERSION_SUFFIX_RE = re.compile(r"@.*$")
+
+
+def _normalize_libc_name(name):
+    """Normalize a glibc-internal alias/variant name back to the standard libc
+    name used in generic_clib_64.gdt.
+
+    Static linking pulls in libc objects whose symbols carry GCC/glibc alias
+    prefixes (``__isoc99_sscanf``, ``__GI_strlen``, ``__ieee754_sqrt@GLIBC_x``)
+    that never match the archive's plain names, so those functions keep their
+    fuzzy Ghidra signatures. Stripping the prefix lets us still inject the
+    exact signature from the archive.
+    """
+    n = _GLIBC_VERSION_SUFFIX_RE.sub("", name)
+    return _GLIBC_ALIAS_PREFIX_RE.sub("", n)
+
+
+def _import_libc_signatures(program, adtm) -> int:
+    """Import libc function signatures from the archive into same-named
+    functions in the program (statically-linked libc copies)."""
+    try:
+        from ghidra.app.util.parser import FunctionSignatureParser
+        from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
+        from ghidra.program.model.symbol import SourceType
+    except Exception as e:
+        logging.debug("signature import unavailable: %s", e)
+        return 0
+
+    func_mgr = program.getFunctionManager()
+    func_by_name = {}
+    func_by_norm = {}
+    for f in func_mgr.getFunctions(True):
+        n = f.getName()
+        if n not in func_by_name:
+            func_by_name[n] = f
+        norm = _normalize_libc_name(n)
+        if norm != n and norm not in func_by_name and norm not in func_by_norm:
+            func_by_norm[norm] = f
+
+    parser = FunctionSignatureParser(program.getDataTypeManager(), None)
+    sig_count = 0
+    tx = program.startTransaction("import libc signatures")
+    try:
+        for dt in adtm.getAllDataTypes():
+            if dt.getClass().getSimpleName() != "FunctionDefinitionDB":
+                continue
+            name = dt.getName()
+            func = func_by_name.get(name)
+            if func is None:
+                func = func_by_norm.get(name)
+            if func is None:
+                continue
+            proto = dt.getPrototypeString()
+            if not proto:
+                continue
+            try:
+                parsed = parser.parse(None, proto)
+                if parsed is None:
+                    continue
+                cmd = ApplyFunctionSignatureCmd(
+                    func.getEntryPoint(), parsed,
+                    SourceType.USER_DEFINED, False, True,
+                )
+                if cmd.applyTo(program):
+                    sig_count += 1
+            except Exception:
+                continue
+    finally:
+        program.endTransaction(tx, True)
+    return sig_count
+
+
+def import_libc_types(program) -> int:
+    """Import common POSIX/C-lib struct types from Ghidra's generic_clib_64
+    archive so the decompiler emits `struct X` (with real member access)
+    instead of opaque byte arrays.
+
+    Returns the number of types imported.
+    """
+    try:
+        from ghidra.program.model.data import (
+            FileDataTypeManager, DataTypeConflictHandler,
+        )
+        from java.io import File as JFile
+    except Exception as e:
+        logging.debug("libc type import unavailable: %s", e)
+        return 0
+
+    install = find_ghidra_install()
+    if install is None:
+        logging.debug("no Ghidra install; skipping libc type import")
+        return 0
+
+    archive = (
+        Path(install) / "Ghidra" / "Features" / "Base" / "data"
+        / "typeinfo" / "generic" / "generic_clib_64.gdt"
+    )
+    if not archive.is_file():
+        logging.debug("libc type archive not found: %s", archive)
+        return 0
+
+    adtm = FileDataTypeManager.openFileArchive(JFile(str(archive)), False)
+    pdtm = program.getDataTypeManager()
+    imported = 0
+    try:
+        tx = program.startTransaction("import libc types")
+        try:
+            for header, name in LIBC_TYPE_TARGETS:
+                dt = adtm.getDataType("/%s/%s" % (header, name))
+                if dt is None:
+                    continue
+                pdtm.addDataType(dt, DataTypeConflictHandler.DEFAULT_HANDLER)
+                imported += 1
+        finally:
+            program.endTransaction(tx, True)
+        sig_count = _import_libc_signatures(program, adtm)
+    finally:
+        adtm.close()
+
+    named_count = _import_named_signatures(program)
+
+    logging.info(
+        "Imported %d libc type(s), %d libc signature(s) from generic_clib_64.gdt, "
+        "%d named-signature(s) from the builtin name table.",
+        imported, sig_count, named_count,
+    )
+    return imported
+
+
+# --------------------------------------------------------------------------- #
+# 名字 → 签名模板：为「非 libc 的内部库函数」注入精确签名
+# --------------------------------------------------------------------------- #
+# generic_clib_64.gdt 只覆盖标准 libc。静态链接二进制（或任何带内部工具库的
+# 程序）里还有一批名字语义固定、跨项目通用的函数（xmalloc/xfree 系列、
+# full_read/full_write 系列、strto* 包装……），Ghidra 对它们只能给出模糊签名
+# （参数个数猜错 → 所有调用者报 too few/many）。这里按名字直接注入精确签名，
+# 把它们变成类型传播的锚点。
+#
+# 每一项: (name 正则 fullmatch, 返回类型, 参数列表)。类型只用 Ghidra C
+# parser 确定能解析的基础类型（int/long/char */void */…，不用 const/typedef）。
+#
+# 注意：这里只放「跨项目通用」的命名。项目特有的内部库函数（如 busybox 的
+# bb_*）放 PROJECT_SIGNATURE_TABLES，通过 GHIDRA_SIG_PROJECTS 环境变量选择
+# 加载，避免污染通用默认。
+NAME_SIGNATURE_TABLE = [
+    # --- 通用 malloc/字符串包装（几乎每个 C 项目都有） ---
+    (r"xmalloc", "void *", ["unsigned long size"]),
+    (r"xcalloc", "void *", ["unsigned long nmemb", "unsigned long size"]),
+    (r"xrealloc", "void *", ["void *ptr", "unsigned long size"]),
+    (r"xfree", "void", ["void *ptr"]),
+    (r"xstrdup", "char *", ["char *s"]),
+    (r"xstrndup", "char *", ["char *s", "unsigned long n"]),
+    (r"xmemdup", "void *", ["void *p", "unsigned long n"]),
+    # --- 通用 fd 读写包装 ---
+    (r"full_write", "int", ["int fd", "void *buf", "int len"]),
+    (r"full_read", "int", ["int fd", "void *buf", "int len"]),
+    (r"xwrite", "int", ["int fd", "void *buf", "int len"]),
+    (r"xread", "int", ["int fd", "void *buf", "int len"]),
+    (r"xopen", "int", ["char *path", "int flags"]),
+    (r"xopen3", "int", ["char *path", "int flags", "int mode"]),
+    (r"xclose", "void", ["int fd"]),
+]
+
+# 项目特有的内部库函数签名表（可选加载）。通过 GHIDRA_SIG_PROJECTS=busybox 这类
+# 环境变量（逗号分隔）启用。按项目沉淀自己的内部库（busybox libbb、openssl 内部
+# 等），与通用默认表解耦。
+PROJECT_SIGNATURE_TABLES = {
+    "busybox": [
+        # strto* 语义包装
+        (r"bb_strtou", "unsigned long", ["char *arg", "char **endp", "int base"]),
+        (r"bb_strtoll", "long long", ["char *arg", "char **endp", "int base"]),
+        (r"bb_strtoull", "unsigned long long", ["char *arg", "char **endp", "int base"]),
+        # 信号处理包装
+        (r"bb_signals", "int", ["int sigs", "void *handler"]),
+        (r"bb_signals_norestart", "int", ["int sigs", "void *handler"]),
+    ],
+}
+
+
+def _signature_tables(projects=None):
+    """返回参与匹配的表列表：通用表 + 指定项目表。"""
+    tables = [NAME_SIGNATURE_TABLE]
+    if projects:
+        for proj in projects:
+            extra = PROJECT_SIGNATURE_TABLES.get(proj)
+            if extra is not None:
+                tables.append(extra)
+    return tables
+
+
+def match_name_signature(name, projects=None):
+    """Match *name* against the name→signature tables (generic + optional
+    project tables).
+
+    Returns ``(ret, params)`` or ``None``. Pure function (no Ghidra JVM needed).
+    """
+    for table in _signature_tables(projects):
+        for pattern, ret, params in table:
+            if re.fullmatch(pattern, name):
+                return ret, list(params)
+    return None
+
+
+def _apply_signature_to_func(program, parser, func, ret, params) -> bool:
+    """Apply a signature (ret + param strings) to *func* via Ghidra's
+    FunctionSignatureParser + ApplyFunctionSignatureCmd. Returns success."""
+    from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
+    from ghidra.program.model.symbol import SourceType
+
+    sig_str = "%s %s(%s)" % (ret, func.getName(), ", ".join(params))
+    try:
+        parsed = parser.parse(None, sig_str)
+    except Exception:
+        return False
+    if parsed is None:
+        return False
+    cmd = ApplyFunctionSignatureCmd(
+        func.getEntryPoint(), parsed, SourceType.USER_DEFINED, False, True
+    )
+    return bool(cmd.applyTo(program))
+
+
+def _import_named_signatures(program, projects=None) -> int:
+    """Inject precise signatures for functions whose names match the name→signature
+    tables (generic + optional project tables). Returns count applied.
+
+    *projects* defaults to the ``GHIDRA_SIG_PROJECTS`` env var (comma-separated).
+    """
+    if projects is None:
+        env = os.environ.get("GHIDRA_SIG_PROJECTS", "")
+        projects = [p.strip() for p in env.split(",") if p.strip()] or None
+    try:
+        from ghidra.app.util.parser import FunctionSignatureParser
+    except Exception as e:
+        logging.debug("named signature import unavailable: %s", e)
+        return 0
+
+    func_mgr = program.getFunctionManager()
+    func_by_name = {}
+    for f in func_mgr.getFunctions(True):
+        n = f.getName()
+        if n not in func_by_name:
+            func_by_name[n] = f
+
+    parser = FunctionSignatureParser(program.getDataTypeManager(), None)
+    applied = 0
+    tx = program.startTransaction("import named signatures")
+    try:
+        for name, func in func_by_name.items():
+            match = match_name_signature(name, projects=projects)
+            if match is None:
+                continue
+            ret, params = match
+            if _apply_signature_to_func(program, parser, func, ret, params):
+                applied += 1
+    finally:
+        program.endTransaction(tx, True)
+    return applied
+
+
 def load_binary(
     binary_path: str,
     project_dir: Optional[str] = None,
@@ -376,6 +680,8 @@ def load_binary(
         if log:
             logging.debug(log)
         logging.info("Analysis complete.")
+
+    import_libc_types(program)
 
     return project, program, primary
 
@@ -444,8 +750,21 @@ def decompile_all_functions(
             Path(output_file).parent.mkdir(parents=True, exist_ok=True)
             out_handle = open(output_file, "w", encoding="utf-8")
 
+        per_func_dir = None
+        if not single_file:
+            if output_dir:
+                per_func_dir = Path(output_dir)
+            elif output_file:
+                of = Path(output_file)
+                per_func_dir = of if of.is_dir() else of.parent
+
         count = 0
         total_bytes = 0
+        # 统计同名函数（不同模块的 static 同名函数），输出时加地址后缀避免覆盖
+        name_counts = {}
+        for f in functions:
+            name_counts[f.getName()] = name_counts.get(f.getName(), 0) + 1
+
         for func in functions:
             addr = func.getEntryPoint()
             name = func.getName()
@@ -459,11 +778,13 @@ def decompile_all_functions(
             total_bytes += len(c_code)
             logging.debug("[%4d/%d] %s @ %s", count, total, name, addr)
 
-            if output_dir and not single_file:
+            if per_func_dir is not None:
                 safe_name = "".join(
                     c if c.isalnum() or c in "._-" else "_" for c in name
                 )
-                func_file = Path(output_dir) / f"{safe_name}.c"
+                if name_counts.get(name, 0) > 1:
+                    safe_name = "%s_%s" % (safe_name, str(addr))
+                func_file = per_func_dir / f"{safe_name}.c"
                 func_file.parent.mkdir(parents=True, exist_ok=True)
                 with open(func_file, "w", encoding="utf-8") as f:
                     f.write(f"// Function: {name}\n")
@@ -477,24 +798,6 @@ def decompile_all_functions(
                 out_handle.write(f"// {func.getSignature()}\n\n")
                 out_handle.write(c_code)
                 out_handle.write("\n\n")
-
-            if output_file and not single_file:
-                safe_name = "".join(
-                    c if c.isalnum() or c in "._-" else "_" for c in name
-                )
-                func_file = f"{safe_name}.c"
-                func_path = (
-                    Path(output_file) / func_file
-                    if Path(output_file).is_dir()
-                    else Path(output_file).with_name(func_file)
-                )
-                func_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(func_path, "w", encoding="utf-8") as f:
-                    f.write(f"// Function: {name}\n")
-                    f.write(f"// Address:  {addr}\n")
-                    f.write(f"// Type:     {func.getSignature()}\n")
-                    f.write("// " + "=" * 60 + "\n")
-                    f.write(c_code)
 
         if out_handle:
             out_handle.close()
@@ -541,11 +844,12 @@ def export_program_metadata(program, output_file: str):
 
     sym_table = program.getSymbolTable()
     for sym in sym_table.getExternalSymbols():
+        namespace = sym.getParentNamespace()
         meta["imports"].append(
             {
                 "name": sym.getName(),
                 "address": str(sym.getAddress()) if sym.getAddress() else None,
-                "library": sym.getParentName(),
+                "library": namespace.getName() if namespace else None,
             }
         )
 
@@ -674,6 +978,25 @@ def _worker_init():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
+def _worker_entry(
+    filepath: Path,
+    ghidra_dir: Optional[Path],
+    args_dict: dict,
+    base_input_dir: Optional[Path],
+    result_queue,
+):
+    try:
+        result = _worker_decompile(
+            filepath,
+            ghidra_dir,
+            args_dict,
+            base_input_dir,
+        )
+        result_queue.put(result)
+    except Exception as e:
+        result_queue.put((filepath.name, False, str(e), 0, 0))
+
+
 def _worker_decompile(
     filepath: Path,
     ghidra_dir: Optional[Path],
@@ -690,8 +1013,11 @@ def _worker_decompile(
         setattr(a, k, v)
 
     if not pyghidra.started():
-        install_dir = ghidra_dir or find_ghidra_install()
-        pyghidra.start(verbose=a.verbose, install_dir=install_dir)
+        start_ghidra(
+            ghidra_dir,
+            verbose=a.verbose,
+            max_memory=a.max_memory,
+        )
 
     filename = filepath.name
 
@@ -753,39 +1079,141 @@ def _worker_decompile(
         return (filename, False, str(e), 0, 0)
 
 
+def _run_worker_once(
+    filepath: Path,
+    ghidra_dir: Optional[Path],
+    args,
+    base_input_dir: Optional[Path],
+    timeout: Optional[int],
+) -> Tuple[str, bool, Optional[str], int, int]:
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    args_dict = {
+        k: v
+        for k, v in vars(args).items()
+        if k in (
+            "output_dir",
+            "output_file",
+            "single_file",
+            "mirror",
+            "project_dir",
+            "project_name",
+            "lang",
+            "compiler",
+            "no_analyze",
+            "list_functions",
+            "meta",
+            "functions",
+            "verbose",
+            "max_memory",
+        )
+    }
+
+    process = ctx.Process(
+        target=_worker_entry,
+        args=(filepath, ghidra_dir, args_dict, base_input_dir, result_queue),
+    )
+    process.start()
+
+    if timeout and timeout > 0:
+        process.join(timeout)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            return (
+                filepath.name,
+                False,
+                f"Timed out after {timeout} seconds",
+                0,
+                0,
+            )
+    else:
+        process.join()
+
+    try:
+        return result_queue.get_nowait()
+    except Empty:
+        return (
+            filepath.name,
+            False,
+            f"Worker exited with code {process.exitcode}",
+            0,
+            0,
+        )
+
+
+def _record_worker_result(
+    stats: DecompileStats,
+    state: Dict[str, dict],
+    filepath: Path,
+    result: Tuple[str, bool, Optional[str], int, int],
+):
+    fname, ok, err, num_funcs, num_bytes = result
+    if ok:
+        stats.add_success(num_funcs, num_bytes)
+        if state is not None:
+            file_hash = compute_file_hash(filepath)
+            state[file_hash] = {
+                "file": str(filepath),
+                "status": "success",
+                "functions": num_funcs,
+                "bytes": num_bytes,
+                "timestamp": datetime.now().isoformat(),
+            }
+    else:
+        stats.add_failure(fname, err or "unknown error")
+
+
 def run_parallel(
     files: List[Path],
     ghidra_dir: Optional[Path],
     args,
     stats: DecompileStats,
+    state: Dict[str, dict],
     base_input_dir: Optional[Path],
 ):
-    args_dict = {k: v for k, v in vars(args).items()
-                 if k in ("output_dir", "output_file", "single_file", "mirror",
-                          "project_dir", "project_name", "lang", "compiler",
-                          "no_analyze", "list_functions", "meta", "functions",
-                          "verbose")}
-
     stats.total_files = len(files)
 
-    with concurrent.futures.ProcessPoolExecutor(
+    files_to_process = []
+    for fp in files:
+        if not args.overwrite and args.output_dir:
+            if already_processed(
+                fp,
+                args.output_dir,
+                state,
+                args.overwrite,
+                args.single_file,
+            ):
+                stats.add_skipped()
+                continue
+        files_to_process.append(fp)
+
+    if not files_to_process:
+        return
+
+    with concurrent.futures.ThreadPoolExecutor(
         max_workers=args.parallel,
-        initializer=_worker_init,
     ) as executor:
         future_map = {
             executor.submit(
-                _worker_decompile, fp, ghidra_dir, args_dict, base_input_dir
+                _run_worker_once,
+                fp,
+                ghidra_dir,
+                args,
+                base_input_dir,
+                args.timeout,
             ): fp
-            for fp in files
+            for fp in files_to_process
         }
 
         try:
             for future in concurrent.futures.as_completed(future_map):
                 fp = future_map[future]
                 try:
-                    fname, ok, err, nf, nb = future.result()
+                    result = future.result()
+                    _record_worker_result(stats, state, fp, result)
+                    fname, ok, err, nf, _ = result
                     if ok:
-                        stats.add_success(nf, nb)
                         logging.info(
                             "[%d/%d] OK: %s (%d funcs)",
                             stats.processed_files,
@@ -794,7 +1222,6 @@ def run_parallel(
                             nf,
                         )
                     else:
-                        stats.add_failure(fname, err or "unknown error")
                         logging.error(
                             "[%d/%d] FAIL: %s - %s",
                             stats.processed_files,
@@ -807,7 +1234,8 @@ def run_parallel(
                     logging.error("Exception in worker for %s: %s", fp.name, e)
         except KeyboardInterrupt:
             logging.warning("Interrupted. Shutting down workers...")
-            executor.shutdown(wait=False, cancel_futures=True)
+            for future in future_map:
+                future.cancel()
             raise
 
 
@@ -832,11 +1260,33 @@ def run_sequential(
                 stats.add_skipped()
                 continue
 
-        try:
-            decompile_single_file(fp, ghidra_dir, args, stats, state, base_input_dir)
-        except KeyboardInterrupt:
-            logging.warning("Interrupted at file %d/%d: %s", idx, len(files), fp.name)
-            raise
+        if args.timeout and args.timeout > 0:
+            result = _run_worker_once(
+                fp,
+                ghidra_dir,
+                args,
+                base_input_dir,
+                args.timeout,
+            )
+            _record_worker_result(stats, state, fp, result)
+        else:
+            try:
+                decompile_single_file(
+                    fp,
+                    ghidra_dir,
+                    args,
+                    stats,
+                    state,
+                    base_input_dir,
+                )
+            except KeyboardInterrupt:
+                logging.warning(
+                    "Interrupted at file %d/%d: %s",
+                    idx,
+                    len(files),
+                    fp.name,
+                )
+                raise
 
         memory_cleanup()
 
@@ -1086,6 +1536,17 @@ Examples:
     if args.single_file and not args.output_file:
         parser.error("--single-file requires -O/--output-file")
 
+    if (
+        args.output_dir is None
+        and args.output_file is None
+        and not args.list_functions
+    ):
+        args.output_dir = Path("decompiled_output")
+        logging.info(
+            "No output path specified; using default output directory: %s",
+            args.output_dir,
+        )
+
     if args.parallel == -1:
         args.parallel = os.cpu_count() or 4
 
@@ -1133,12 +1594,6 @@ Examples:
         print(f"\nTotal: {len(input_files)} file(s)\n")
         return
 
-    start_ghidra(
-        ghidra_dir,
-        verbose=args.verbose,
-        max_memory=args.max_memory,
-    )
-
     stats = DecompileStats()
     state: Dict[str, dict] = {}
     if args.resume:
@@ -1155,12 +1610,41 @@ Examples:
             base_input_dir = common.parent
 
     try:
-        if args.parallel > 0 and len(input_files) > 1:
-            logging.info(
-                "Starting parallel processing with %d workers.", args.parallel
-            )
-            run_parallel(input_files, ghidra_dir, args, stats, base_input_dir)
+        use_parallel = args.parallel > 0 and len(input_files) > 1
+        use_timeout_worker = bool(args.timeout and args.timeout > 0)
+
+        if use_parallel or use_timeout_worker:
+            if use_parallel:
+                logging.info(
+                    "Starting parallel processing with %d workers.",
+                    args.parallel,
+                )
+                run_parallel(
+                    input_files,
+                    ghidra_dir,
+                    args,
+                    stats,
+                    state,
+                    base_input_dir,
+                )
+            else:
+                run_sequential(
+                    input_files,
+                    ghidra_dir,
+                    args,
+                    stats,
+                    state,
+                    base_input_dir,
+                )
         else:
+            start_ghidra(
+                ghidra_dir,
+                verbose=args.verbose,
+                max_memory=args.max_memory,
+            )
+            logging.info(
+                "Starting sequential processing."
+            )
             run_sequential(
                 input_files, ghidra_dir, args, stats, state, base_input_dir
             )

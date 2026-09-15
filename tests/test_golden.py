@@ -6,7 +6,9 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+PLUGIN_DIR = os.path.join(os.path.dirname(HERE), "plugins")
+sys.path.insert(0, PLUGIN_DIR)
 
 import decompile_helper as dh
 

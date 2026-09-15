@@ -1,5 +1,76 @@
+# =============================================================================
+# 本仓库只提交：项目源码、公开说明、测试代码和可复现测试样本。
+# 本机工具、虚拟环境、生成结果、私有资料统一放在 ignore/。
+# =============================================================================
+
+# 本地文件归档区
+/ignore/
+
+# Codex/代理工作环境挂载点（无法移动到 ignore/）
+.agents/
+.codex/
+.claude/
+
+# Python 缓存与测试缓存
 __pycache__/
-*.pyc
-*.pyo
-*.bak
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Python 虚拟环境（新增环境应优先放在 ignore/envs/）
+.venv/
+venv/
+env/
+ENV/
+
+# 密钥和仅限本机的环境配置
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# 反编译、构建和自动修复生成物
+decompiled_output/
+decomp_out/
+decomp_build/
+static_build/
+batch_work/
+*_work/
 _test_tmp/
+patches.json
+compile_feedback/
+
+# Ghidra 默认在输入旁生成的项目数据库
+*_ghidra_decomp.gpr
+*_ghidra_decomp.rep/
+*_ghidra_decomp.lock*
+
+# 编译产物；固定测试目标文件必须保留
+*.o
+*.obj
+rebuilt.exe
+!/tests/test_complex.o
+
+# 日志、临时文件和备份文件
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# 编辑器和操作系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

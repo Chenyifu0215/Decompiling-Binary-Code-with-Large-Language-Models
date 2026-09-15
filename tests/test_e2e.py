@@ -12,9 +12,9 @@ import sys
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 HERE = os.path.dirname(os.path.abspath(__file__))
+PLUGIN_DIR = os.path.join(os.path.dirname(HERE), "plugins")
+sys.path.insert(0, PLUGIN_DIR)
 BINARY = os.path.join(HERE, "test_complex.o")
 DECOMP_DIR = os.path.join(HERE, "test_out_fixed")
 
@@ -47,7 +47,7 @@ class TestEndToEnd:
 
         # 1. decompile_helper all 生成工程
         r = subprocess.run(
-            [sys.executable, os.path.join(HERE, "decompile_helper.py"), "all",
+            [sys.executable, os.path.join(PLUGIN_DIR, "decompile_helper.py"), "all",
              BINARY, DECOMP_DIR, "-o", build_dir],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
@@ -69,7 +69,7 @@ class TestEndToEnd:
         """生成的头文件应包含补全的 longlong/uchar typedef。"""
         build_dir = str(tmp_path / "build")
         subprocess.run(
-            [sys.executable, os.path.join(HERE, "decompile_helper.py"), "all",
+            [sys.executable, os.path.join(PLUGIN_DIR, "decompile_helper.py"), "all",
              BINARY, DECOMP_DIR, "-o", build_dir],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )

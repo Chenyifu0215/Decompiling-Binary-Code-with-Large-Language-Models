@@ -33,6 +33,8 @@ import sys
 from pathlib import Path
 
 from patch import apply_patch_list, load_patches, save_patches
+
+SCRIPT_DIR = Path(__file__).resolve().parent
 from llm import make_proposer
 
 LOG = logging.getLogger("orchestrator")
@@ -114,7 +116,7 @@ def parse_errors(output):
 def prepare_build(binary, decomp_dir, build_dir, map_path=None):
     """Regenerate a clean build dir via decompile_helper.py `all`."""
     cmd = [
-        sys.executable, "decompile_helper.py", "all",
+        sys.executable, str(SCRIPT_DIR / "decompile_helper.py"), "all",
         binary, decomp_dir, "-o", build_dir,
     ]
     if map_path:
