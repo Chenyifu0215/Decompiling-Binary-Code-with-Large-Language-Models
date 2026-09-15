@@ -262,9 +262,14 @@ def parse_signature(text):
         m = re.match(r"^(.*?)\s+([\w.\-]+)\s*\((.*)\)\s*$", stripped)
         if m:
             ret = m.group(1).strip()
+            # Ghidra 的「数组指针」抽象声明符 `undefined1 (*) [16]` → `undefined1 *`
+            # （返回类型必须规范化：抽象声明符不是合法 C）。
+            ret = re.sub(r"\(\s*\*\s*\)\s*\[\s*\d+\s*\]", "*", ret)
             ret = re.sub(r"\s*\[\s*\d+\s*\]", " *", ret)
             ret = re.sub(r"\s+", " ", ret)
-            return ret, m.group(2), m.group(3).strip()
+            # 参数里的 `(*param_1) [16]` 是合法 C（且支持 param_1[i][j]），保留不动。
+            params = re.sub(r"\s+", " ", m.group(3).strip())
+            return ret, m.group(2), params
         break
     return None
 
@@ -531,6 +536,9 @@ def repair_source_file(src_path, dst_path, value_used=None, global_names=None,
             break
 
         ret = m.group(1).strip()
+        # 数组指针抽象声明符 `undefined1 (*) [16]` → `undefined1 *`
+        # （返回类型必须规范化；参数保留 `(*p) [N]`，与 parse_signature 一致）
+        ret = re.sub(r"\(\s*\*\s*\)\s*\[\s*\d+\s*\]", "*", ret)
         ret = re.sub(r"\s*\[\s*\d+\s*\]", " *", ret)
         ret = re.sub(r"\s+", " ", ret)
         ret = _rewrite_struct_types(ret)
