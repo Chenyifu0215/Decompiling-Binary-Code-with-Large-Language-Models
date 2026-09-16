@@ -781,4 +781,3 @@ error: pasting "A" and ";" does not give a valid preprocessing token
 #define CAT(a,b) a ## b
 CAT(123, ;) // 拼接结果 123;，不是合法 token
 ```
-123
