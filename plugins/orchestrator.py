@@ -10,9 +10,8 @@ Convergence criterion is compile success only (no runtime oracle). The loop:
       -> else: proposer (fallback rules or LLM) emits new patches
       -> append + persist, repeat
 
-Patch state lives in a JSON file and is replayed from the clean base each
-iteration, so every run is deterministic and reversible (delete the patch file
-to roll back).
+Patch state lives in a JSON file. Prepared builds replay it from a clean base
+each iteration; `--no-prepare` applies each patch once to the current tree.
 
 Usage:
     python orchestrator.py <binary> <decomp_dir> [options]
@@ -40,12 +39,13 @@ from llm import make_proposer
 LOG = logging.getLogger("orchestrator")
 
 _ERROR_RE = re.compile(
-    r"^([^:\n]+):(\d+):(\d+):\s*(error|warning):\s*(.*)$"
+    r"^(.+?):(\d+)(?::(\d+))?:\s*(fatal error|error|warning):\s*(.*)$"
 )
 
 # 链接错误：/usr/bin/ld: foo.c:(.text+0xd): undefined reference to `bar'
 _UNDEF_RE = re.compile(r"undefined reference to [`']([^`']+)[`']")
 _UNDEF_FILE_RE = re.compile(r"([A-Za-z0-9_.\-]+\.(?:c|h)):\(")
+_MULTIDEF_RE = re.compile(r"multiple definition of [`']([^`']+)[`']")
 
 
 def to_wsl(path):
@@ -92,8 +92,8 @@ def parse_errors(output):
                 {
                     "file": m.group(1),
                     "line": int(m.group(2)),
-                    "col": int(m.group(3)),
-                    "kind": m.group(4),
+                    "col": int(m.group(3) or 0),
+                    "kind": "error" if m.group(4) == "fatal error" else m.group(4),
                     "message": m.group(5),
                 }
             )
@@ -108,6 +108,19 @@ def parse_errors(output):
                     "col": 0,
                     "kind": "error",
                     "message": "undefined reference to '%s'" % u.group(1),
+                }
+            )
+            continue
+        multiple = _MULTIDEF_RE.search(line)
+        if multiple:
+            fm = _UNDEF_FILE_RE.search(line)
+            errors.append(
+                {
+                    "file": fm.group(1) if fm else "",
+                    "line": 0,
+                    "col": 0,
+                    "kind": "error",
+                    "message": "multiple definition of '%s'" % multiple.group(1),
                 }
             )
     return errors
@@ -171,6 +184,7 @@ def main():
     )
 
     patches = load_patches(patch_file)
+    no_prepare_applied = 0
 
     for it in range(args.max_iter):
         LOG.info("=== iteration %d ===", it)
@@ -178,7 +192,13 @@ def main():
         if not args.no_prepare:
             prepare_build(args.binary, args.decomp_dir, build_dir, args.map)
 
-        applied, app_errs = apply_patch_list(build_dir, patches)
+        pending = patches[no_prepare_applied:] if args.no_prepare else patches
+        applied, app_errs = apply_patch_list(build_dir, pending)
+        if args.no_prepare:
+            # A patch is attempted at most once against a tree that is not
+            # regenerated between iterations. Retrying the whole history can
+            # corrupt non-idempotent replacements such as int -> unsigned int.
+            no_prepare_applied = len(patches)
         if app_errs:
             LOG.warning("patch application issues: %s", app_errs)
 

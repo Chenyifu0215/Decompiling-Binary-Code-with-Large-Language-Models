@@ -48,8 +48,8 @@ undefined1  [16] apply_op(undefined4 param_1,uint param_2,ulong param_3)
 """
         out = _repair(tmp_path, src)
         assert "undefined1 * apply_op(undefined4 param_1,uint param_2,ulong param_3)" in out
-        assert "*(undefined8 *)((char *)auVar3 + 8) = param_3;" in out
-        assert "*(undefined8 *)((char *)auVar3 + 0) = uVar1;" in out
+        assert "*(undefined8 *)((char *)&auVar3 + 8) = param_3;" in out
+        assert "*(undefined8 *)((char *)&auVar3 + 0) = uVar1;" in out
 
     def test_struct_cast_rewrite(self, tmp_path):
         """sigaction 裸名 cast → struct sigaction。"""
@@ -71,6 +71,19 @@ undefined1  [16] apply_op(undefined4 param_1,uint param_2,ulong param_3)
 """
         out = _repair(tmp_path, src, global_names=["bb_common_bufsiz1"])
         assert "bb_common_bufsiz1 = 1;" in out
+
+    def test_literals_and_line_comments_are_not_rewritten(self, tmp_path):
+        literal = 'stat /* literal */ (sigaction *) _g_seed au._0_4_ stack0x10'
+        src = """int f(void)
+{
+  // stat (sigaction *) _g_seed au._0_4_ stack0x10
+  puts(\"%s\");
+  return 0;
+}
+""" % literal
+        out = _repair(tmp_path, src, global_names=["g_seed"])
+        assert 'puts("%s");' % literal in out
+        assert "// stat (sigaction *) _g_seed au._0_4_ stack0x10" in out
 
     def test_stack_ref_decl(self, tmp_path):
         """stack0x 引用 → 自动声明。"""

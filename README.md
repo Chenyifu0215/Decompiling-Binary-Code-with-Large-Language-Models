@@ -105,9 +105,12 @@ python plugins/decompile_binary.py sample.exe --list-functions
 
 # 预览将处理哪些输入文件
 python plugins/decompile_binary.py ./binaries --recursive --dry-run
+
+# shell 未展开通配符时，工具也会主动展开
+python plugins/decompile_binary.py "tests/*.o" -o ignore/generated/decomp_out
 ```
 
-默认情况下，每个输入文件会在输出目录下形成 `<文件名>_decomp/`，其中通常按函数保存 `.c` 文件。详细参数见 `plugins/decompile_binary_usage.txt` 或：
+默认情况下，每个输入文件会在输出目录下形成 `<文件名>_decomp/`，其中通常按函数保存 `.c` 文件。若多个输入具有相同文件名，目录名会追加由完整输入路径生成的稳定短哈希，避免相互覆盖。重名函数会在反编译前按入口地址生成唯一名称，使定义和调用保持一致。`--meta` 和 `--list-functions` 的文件也会写入对应的每文件输出目录。详细参数见 `plugins/decompile_binary_usage.txt` 或：
 
 ```bash
 python plugins/decompile_binary.py --help
@@ -118,7 +121,7 @@ python plugins/decompile_binary.py --help
 | 参数 | 用途 |
 | --- | --- |
 | `--single-file -O <file.c>` | 合并输出到指定 C 文件；后续工程生成流程使用按函数拆分的输出 |
-| `--resume <state.json>` | 使用状态文件续跑，建议把状态放入 `ignore/generated/` |
+| `--resume <state.json>` | 使用状态文件续跑；只有与当前输入路径和内容哈希匹配的成功记录会被跳过，建议把状态放入 `ignore/generated/` |
 | `--timeout <秒>`、`--max-memory 4G` | 限制处理时间、JVM 堆内存 |
 | `--meta`、`--mirror` | 导出元数据、保留输入目录层次 |
 | `--config <json或yaml>`、`--log-file <文件>` | 加载选项配置、写入日志 |
@@ -152,6 +155,8 @@ Linux 下可直接编译：
 ```bash
 make -C ignore/generated/decomp_build/sample_build
 ```
+
+生成的 Makefile 会记录源码对生成头文件的依赖；修改 `globals.h`、函数原型或兼容头后，普通增量 `make` 会重新编译受影响的目标文件。
 
 如果拥有 GNU ld map 文件，可以在生成工程时传入 `--map <文件>`，用于过滤静态链接进二进制的系统库函数。各个独立子命令如下：
 
@@ -250,7 +255,7 @@ python plugins/fix_argcount.py \
   ignore/generated/decomp_build/sample_build
 ```
 
-`fix_undeclared.py --log <文件>` 可以使用已有编译日志；当前没有 `--map` 参数。`fix_argcount.py` 支持 `--min-votes`（默认 2），且要求相同参数数量至少占调用点的 90%；它尽量保留已有参数类型。`--dry-run` 不改源码，但仍会调用 Make 来收集错误。建议先使用相应命令的 `--help` 检查完整参数。
+`fix_undeclared.py --log <文件>` 可以使用已有编译日志；当前没有 `--map` 参数。对于可从目标文件定位的数据符号，它会同时向 `globals.h` 写入外部声明，并在 `data_defs.c` 中恢复定义和可读取的初值。`fix_argcount.py` 支持 `--min-votes`（默认 2），且要求相同参数数量至少占调用点的 90%；调整数量时会保留已有参数的类型和名称，只为新增参数生成名称。`--dry-run` 不改源码，但仍会调用 Make 来收集错误。建议先使用相应命令的 `--help` 检查完整参数。
 
 ### 5. 图形界面
 

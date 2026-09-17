@@ -7,7 +7,7 @@ GCC 报 too few/many arguments 说明「被调函数声明的参数数」与「�
 流程：
   1. make -k 收集 too few/many 报错的被调函数名。
   2. 扫描 build 的 .c，统计这些函数在所有调用点的参数数（取众数 N）。
-  3. 把 function_prototypes.h 和 .c 里的函数定义改成 N 个 undefined8 参数。
+  3. 保留已有参数声明，并把 function_prototypes.h 和 .c 定义调整为 N 个参数。
 
 用法：
     python fix_argcount.py <build_dir> [--min-votes N]
@@ -71,17 +71,55 @@ def count_args_at(text, pos):
     return 0 if not body else commas + 1
 
 
+def _mask_non_code(text):
+    """Replace comments and literals with spaces while preserving offsets."""
+    chars = list(text)
+    i = 0
+    while i < len(text):
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = len(text) if end == -1 else end
+        elif text.startswith("/*", i):
+            close = text.find("*/", i + 2)
+            end = len(text) if close == -1 else close + 2
+        elif text[i] in ('"', "'"):
+            quote = text[i]
+            end = i + 1
+            while end < len(text):
+                if text[end] == "\\":
+                    end = min(end + 2, len(text))
+                elif text[end] == quote:
+                    end += 1
+                    break
+                else:
+                    end += 1
+        else:
+            i += 1
+            continue
+        for pos in range(i, end):
+            if chars[pos] != "\n":
+                chars[pos] = " "
+        i = end
+    return "".join(chars)
+
+
 def collect_arg_votes(build_dir, names):
     """统计 names 里每个函数在各调用点的参数数分布 {name: Counter}。"""
     votes = collections.defaultdict(collections.Counter)
     pats = {n: re.compile(r"\b" + re.escape(n) + r"\s*\(") for n in names}
     # 定义/声明行：行首（可选 extern）返回类型 + 函数名 + (
-    def_re = {n: re.compile(r"(?m)^(?:extern\s+)?[A-Za-z_][\w \*]*?\b"
-                            + re.escape(n) + r"\s*\(") for n in names}
+    def_re = {
+        n: re.compile(
+            r"(?m)^[ \t]*(?!(?:return|if|for|while|switch|sizeof)\b)"
+            r"(?:extern\s+)?[A-Za-z_][\w \t\*]*?\b("
+            + re.escape(n) + r")\s*\("
+        )
+        for n in names
+    }
     for p in build_dir.glob("*.c"):
-        text = p.read_text(encoding="utf-8", errors="replace")
+        text = _mask_non_code(p.read_text(encoding="utf-8", errors="replace"))
         for n in names:
-            skip_spans = {m.start() for m in def_re[n].finditer(text)}
+            skip_spans = {m.start(1) for m in def_re[n].finditer(text)}
             for m in pats[n].finditer(text):
                 if m.start() in skip_spans:
                     continue
@@ -89,20 +127,11 @@ def collect_arg_votes(build_dir, names):
     return votes
 
 
-def _strip_param_name(p):
-    """从 'long *param_1' 提取类型 'long *'；无参数名则原样返回。"""
-    p = p.strip()
-    m = re.match(r"^(.*?)\s*\b([A-Za-z_]\w*)\s*$", p)
-    if m and m.group(1).strip():
-        return m.group(1).strip()
-    return p
-
-
 def rewrite_params(text, name, nargs):
     """只把「定义/声明行」里 name(...) 调成 nargs 个参数。
 
-    保留已有参数的类型（只改个数），不足的补 undefined8——这样函数体里对
-    参数指针的索引/解引用不会因为类型被换成整数而报错。
+    保留已有参数的完整声明（包括名称），不足的补 undefined8——这样函数体里
+    对原参数名的引用，以及参数指针的索引/解引用，都不会因签名修复而失效。
     """
     pat = re.compile(
         r"(?m)^((?:extern\s+)?[A-Za-z_][\w \*]*?\b" + re.escape(name) + r"\s*)"
@@ -110,16 +139,21 @@ def rewrite_params(text, name, nargs):
 
     def repl(m):
         prefix, params_str = m.group(1), m.group(2)
-        old_types = [_strip_param_name(p) for p in params_str.split(",") if p.strip()]
-        if old_types == ["void"]:
-            old_types = []
-        if nargs <= len(old_types):
-            types = old_types[:nargs]
-        else:
-            types = old_types + ["undefined8"] * (nargs - len(old_types))
-        if types:
-            new_params = ", ".join("%s param_%d" % (t, i + 1)
-                                   for i, t in enumerate(types))
+        old_params = [p.strip() for p in params_str.split(",") if p.strip()]
+        if old_params == ["void"]:
+            old_params = []
+        params = old_params[:nargs]
+        used_names = set(re.findall(r"\b[A-Za-z_]\w*\b", params_str))
+        for position in range(len(old_params) + 1, nargs + 1):
+            param_name = "param_%d" % position
+            suffix = 2
+            while param_name in used_names:
+                param_name = "param_%d_%d" % (position, suffix)
+                suffix += 1
+            used_names.add(param_name)
+            params.append("undefined8 %s" % param_name)
+        if params:
+            new_params = ", ".join(params)
         else:
             new_params = "void"
         return prefix + "(" + new_params + ")"

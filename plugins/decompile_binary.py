@@ -27,6 +27,7 @@ Requirements:
 
 import argparse
 import concurrent.futures
+import glob
 import hashlib
 import json
 import logging
@@ -157,43 +158,52 @@ def gather_input_files(
     seen = set()
 
     for raw in paths:
-        p = Path(raw)
-        if not p.exists():
+        expanded_raw = os.path.expanduser(raw)
+        matches = glob.glob(expanded_raw, recursive=recursive) if glob.has_magic(
+            expanded_raw
+        ) else [expanded_raw]
+        if not matches:
             logging.warning("Path does not exist, skipping: %s", raw)
             continue
 
-        if p.is_file():
-            resolved = p.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                result.append(resolved)
+        for match in matches:
+            p = Path(match)
+            if not p.exists():
+                logging.warning("Path does not exist, skipping: %s", match)
+                continue
 
-        elif p.is_dir():
-            pattern = "**/*" if recursive else "*"
-            for item in sorted(p.glob(pattern)):
-                if not item.is_file():
-                    continue
-                if not follow_symlinks and item.is_symlink():
-                    continue
-                resolved = item.resolve()
-                if resolved in seen:
-                    continue
-                seen.add(resolved)
-                ext = item.suffix.lower()
-                if ext in SKIP_EXTENSIONS:
-                    logging.debug("Skipping non-code file: %s", item)
-                    continue
-                if skip_non_binary and ext not in BINARY_EXTENSIONS:
-                    continue
-                result.append(resolved)
+            if p.is_file():
+                resolved = p.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    result.append(resolved)
 
-        else:
-            resolved = p.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                result.append(resolved)
+            elif p.is_dir():
+                pattern = "**/*" if recursive else "*"
+                for item in sorted(p.glob(pattern)):
+                    if not item.is_file():
+                        continue
+                    if not follow_symlinks and item.is_symlink():
+                        continue
+                    resolved = item.resolve()
+                    if resolved in seen:
+                        continue
+                    seen.add(resolved)
+                    ext = item.suffix.lower()
+                    if ext in SKIP_EXTENSIONS:
+                        logging.debug("Skipping non-code file: %s", item)
+                        continue
+                    if skip_non_binary and ext not in BINARY_EXTENSIONS:
+                        continue
+                    result.append(resolved)
 
-    return sorted(result, key=lambda x: x.name.lower())
+            else:
+                resolved = p.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    result.append(resolved)
+
+    return sorted(result, key=lambda x: (x.name.lower(), str(x)))
 
 
 def find_ghidra_install() -> Optional[Path]:
@@ -293,18 +303,14 @@ def already_processed(
 
     if fhash in state:
         entry = state[fhash]
-        if entry.get("status") == "success":
+        recorded_file = entry.get("file")
+        if (
+            entry.get("status") == "success"
+            and recorded_file
+            and Path(recorded_file).resolve() == filepath.resolve()
+        ):
             logging.info("Skipping (already processed): %s", filepath.name)
             return True
-
-    if single_file_mode:
-        return False
-
-    stem = filepath.stem
-    expected = output_dir / f"{stem}_decomp"
-    if expected.is_dir() and any(expected.glob("*.c")):
-        logging.info("Skipping (output exists): %s", filepath.name)
-        return True
 
     return False
 
@@ -316,6 +322,7 @@ def get_output_paths(
     single_file: bool,
     mirror_structure: bool,
     base_input_dir: Optional[Path],
+    output_subdirs: Optional[Dict[str, str]] = None,
 ) -> Tuple[Optional[Path], Optional[Path]]:
     per_file_dir = None
     single_output = None
@@ -333,9 +340,29 @@ def get_output_paths(
             except ValueError:
                 per_file_dir = output_dir / f"{filepath.stem}_decomp"
         else:
-            per_file_dir = output_dir / f"{filepath.stem}_decomp"
+            dirname = (output_subdirs or {}).get(
+                str(filepath.resolve()), f"{filepath.stem}_decomp",
+            )
+            per_file_dir = output_dir / dirname
 
     return per_file_dir, single_output
+
+
+def assign_output_subdirs(files: List[Path]) -> Dict[str, str]:
+    """Assign stable unique output directory names to colliding input stems."""
+    by_stem = {}
+    for filepath in files:
+        by_stem.setdefault(filepath.stem.casefold(), []).append(filepath)
+    result = {}
+    for group in by_stem.values():
+        if len(group) < 2:
+            continue
+        for filepath in group:
+            digest = hashlib.sha256(
+                str(filepath.resolve()).encode("utf-8")
+            ).hexdigest()[:8]
+            result[str(filepath.resolve())] = "%s_%s_decomp" % (filepath.stem, digest)
+    return result
 
 
 LIBC_TYPE_TARGETS = [
@@ -691,9 +718,61 @@ def decompile_function(program, func, decompiler) -> Optional[str]:
     if result is None:
         return None
     if not result.decompileCompleted():
-        err = result.getErrorMessage()
-        return f"/* Decompilation error: {err} */\n"
+        logging.warning(
+            "Failed to decompile %s @ %s: %s",
+            func.getName(), func.getEntryPoint(), result.getErrorMessage(),
+        )
+        return None
     return result.getDecompiledFunction().getC()
+
+
+def function_output_filename(func, duplicate=False):
+    """Return the stable per-function filename used by all exporters."""
+    safe_name = "".join(
+        c if c.isalnum() or c in "._-" else "_" for c in func.getName()
+    )
+    if duplicate:
+        safe_address = "".join(
+            c if c.isalnum() or c in "._-" else "_"
+            for c in str(func.getEntryPoint())
+        )
+        safe_name = "%s_%s" % (safe_name, safe_address)
+    return safe_name + ".c"
+
+
+def uniquify_duplicate_function_names(program, functions, source_type=None):
+    """Rename duplicate Ghidra functions by address so calls stay unambiguous."""
+    groups = {}
+    for func in functions:
+        groups.setdefault(func.getName(), []).append(func)
+    duplicates = [group for group in groups.values() if len(group) > 1]
+    if not duplicates:
+        return 0
+    if source_type is None:
+        from ghidra.program.model.symbol import SourceType
+        source_type = SourceType.USER_DEFINED
+
+    existing = {func.getName() for func in functions}
+    tx = program.startTransaction("uniquify duplicate function names")
+    renamed = 0
+    try:
+        for group in duplicates:
+            original = group[0].getName()
+            for func in group:
+                address = "".join(
+                    c if c.isalnum() else "_" for c in str(func.getEntryPoint())
+                )
+                candidate = "%s_%s" % (original, address)
+                suffix = 2
+                while candidate in existing:
+                    candidate = "%s_%s_%d" % (original, address, suffix)
+                    suffix += 1
+                func.setName(candidate, source_type)
+                existing.add(candidate)
+                renamed += 1
+    finally:
+        program.endTransaction(tx, True)
+    return renamed
 
 
 def decompile_all_functions(
@@ -745,6 +824,10 @@ def decompile_all_functions(
                     logging.warning("Function not found: %s", spec)
             functions = filtered
 
+        renamed = uniquify_duplicate_function_names(program, functions)
+        if renamed:
+            logging.info("Renamed %d duplicate functions using entry addresses.", renamed)
+
         out_handle = None
         if output_file and single_file:
             Path(output_file).parent.mkdir(parents=True, exist_ok=True)
@@ -779,12 +862,9 @@ def decompile_all_functions(
             logging.debug("[%4d/%d] %s @ %s", count, total, name, addr)
 
             if per_func_dir is not None:
-                safe_name = "".join(
-                    c if c.isalnum() or c in "._-" else "_" for c in name
+                func_file = per_func_dir / function_output_filename(
+                    func, duplicate=name_counts.get(name, 0) > 1,
                 )
-                if name_counts.get(name, 0) > 1:
-                    safe_name = "%s_%s" % (safe_name, str(addr))
-                func_file = per_func_dir / f"{safe_name}.c"
                 func_file.parent.mkdir(parents=True, exist_ok=True)
                 with open(func_file, "w", encoding="utf-8") as f:
                     f.write(f"// Function: {name}\n")
@@ -897,6 +977,7 @@ def decompile_single_file(
         args.single_file,
         args.mirror,
         base_input_dir,
+        getattr(args, "output_subdirs", None),
     )
 
     try:
@@ -923,8 +1004,8 @@ def decompile_single_file(
             output = "\n".join(
                 [f"Function List for {filename}:", "-" * 60] + lines
             )
-            if args.output_dir:
-                list_file = Path(args.output_dir) / f"{filepath.stem}_functions.txt"
+            if per_file_dir:
+                list_file = per_file_dir / "functions.txt"
                 list_file.parent.mkdir(parents=True, exist_ok=True)
                 list_file.write_text(output, encoding="utf-8")
             else:
@@ -933,7 +1014,9 @@ def decompile_single_file(
             return True
 
         if args.meta:
-            meta_output = per_file_dir.parent / f"{filepath.stem}_meta.json" if per_file_dir else Path(f"{filepath.stem}_meta.json")
+            meta_output = per_file_dir / "metadata.json" if per_file_dir else Path(
+                f"{filepath.stem}_meta.json"
+            )
             export_program_metadata(program, str(meta_output))
 
         output_dir_str = str(per_file_dir) if per_file_dir else None
@@ -1029,6 +1112,7 @@ def _worker_decompile(
             a.single_file,
             a.mirror,
             base_input_dir,
+            getattr(a, "output_subdirs", None),
         )
 
         project, program, primary_loaded = load_binary(
@@ -1046,14 +1130,16 @@ def _worker_decompile(
                     f"{func.getEntryPoint()}  {func.getName()}()"
                     for func in program.getFunctionManager().getFunctions(True)
                 )
-                if a.output_dir:
-                    list_file = Path(a.output_dir) / f"{filepath.stem}_functions.txt"
+                if per_file_dir:
+                    list_file = per_file_dir / "functions.txt"
                     list_file.parent.mkdir(parents=True, exist_ok=True)
                     list_file.write_text(output, encoding="utf-8")
                 return (filename, True, None, 0, 0)
 
             if a.meta:
-                meta_output = per_file_dir.parent / f"{filepath.stem}_meta.json" if per_file_dir else Path(f"{filepath.stem}_meta.json")
+                meta_output = per_file_dir / "metadata.json" if per_file_dir else Path(
+                    f"{filepath.stem}_meta.json"
+                )
                 export_program_metadata(program, str(meta_output))
 
             output_dir_str = str(per_file_dir) if per_file_dir else None
@@ -1106,6 +1192,7 @@ def _run_worker_once(
             "functions",
             "verbose",
             "max_memory",
+            "output_subdirs",
         )
     }
 
@@ -1319,18 +1406,18 @@ def load_config(config_path: str) -> dict:
 
 def apply_config(args: argparse.Namespace, config: dict) -> argparse.Namespace:
     mapping = {
-        "output_dir": "output_dir",
-        "output_file": "output_file",
-        "project_dir": "project_dir",
-        "project_name": "project_name",
-        "lang": "lang",
-        "compiler": "compiler",
-        "ghidra_dir": "ghidra_dir",
-        "parallel": "parallel",
-        "timeout": "timeout",
-        "max_memory": "max_memory",
-        "resume": "resume",
-        "log_file": "log_file",
+        "output_dir": ("output_dir", Path),
+        "output_file": ("output_file", Path),
+        "project_dir": ("project_dir", Path),
+        "project_name": ("project_name", str),
+        "lang": ("lang", str),
+        "compiler": ("compiler", str),
+        "ghidra_dir": ("ghidra_dir", Path),
+        "parallel": ("parallel", int),
+        "timeout": ("timeout", int),
+        "max_memory": ("max_memory", str),
+        "resume": ("resume", Path),
+        "log_file": ("log_file", Path),
     }
     bool_mapping = {
         "single_file": "single_file",
@@ -1346,9 +1433,9 @@ def apply_config(args: argparse.Namespace, config: dict) -> argparse.Namespace:
         "skip_non_binary": "skip_non_binary",
     }
 
-    for cfg_key, arg_key in mapping.items():
-        if cfg_key in config:
-            setattr(args, arg_key, config[cfg_key])
+    for cfg_key, (arg_key, converter) in mapping.items():
+        if cfg_key in config and config[cfg_key] is not None:
+            setattr(args, arg_key, converter(config[cfg_key]))
     for cfg_key, arg_key in bool_mapping.items():
         if cfg_key in config:
             setattr(args, arg_key, bool(config[cfg_key]))
@@ -1608,6 +1695,8 @@ Examples:
             base_input_dir = common
         else:
             base_input_dir = common.parent
+
+    args.output_subdirs = {} if args.mirror else assign_output_subdirs(input_files)
 
     try:
         use_parallel = args.parallel > 0 and len(input_files) > 1

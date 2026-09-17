@@ -4,6 +4,7 @@
 """
 
 import os
+from pathlib import Path
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -16,6 +17,7 @@ import decompile_helper as dh
 import orchestrator as orch
 import patch as patch_mod
 import llm as llm_mod
+import fix_argcount as fa
 import fix_signatures_llm as fsllm
 import decompile_binary as db
 
@@ -27,11 +29,11 @@ import decompile_binary as db
 class TestSliceSyntax:
     def test_slice_8(self):
         assert dh._repair_slice_syntax("auVar3._8_8_ = x;") == \
-            "*(undefined8 *)((char *)auVar3 + 8) = x;"
+            "*(undefined8 *)((char *)&auVar3 + 8) = x;"
 
     def test_slice_0_4(self):
         assert dh._repair_slice_syntax("buf._0_4_ = y;") == \
-            "*(undefined4 *)((char *)buf + 0) = y;"
+            "*(undefined4 *)((char *)&buf + 0) = y;"
 
     def test_unknown_size_untouched(self):
         assert dh._repair_slice_syntax("a._16_16_ = z;") == "a._16_16_ = z;"
@@ -54,6 +56,16 @@ class TestStripBlockComments:
     def test_multiline(self):
         assert dh._strip_block_comments("a /* c1\nc2 */ b") == "a  b"
 
+    def test_delimiters_in_literals_are_preserved(self):
+        text = 'puts("stat /* literal */"); /* comment */ char c = \'/\';'
+        assert dh._strip_block_comments(text) == \
+            'puts("stat /* literal */");  char c = \'/\';'
+
+    def test_delimiters_in_line_comments_are_preserved(self):
+        text = "a; // /* not a block comment */\nb; /* comment */ c;"
+        assert dh._strip_block_comments(text) == \
+            "a; // /* not a block comment */\nb;  c;"
+
 
 class TestParseSignature:
     def test_returns_tuple(self):
@@ -69,6 +81,15 @@ class TestParseSignature:
         text = "// Function: f\n// Type: x\n\nint f(int a)"
         assert dh.parse_signature(text) == ("int", "f", "int a")
 
+    def test_multiline_parameters(self):
+        text = "int callee(int a,\n           int b)\n{\n  return a + b;\n}"
+        assert dh.parse_signature(text) == ("int", "callee", "int a, int b")
+
+    def test_name_and_parameters_on_separate_lines(self):
+        text = "undefined1 [16] build\n\n  (int a,\n   int b)\n{\n}"
+        assert dh.parse_signature(text) == \
+            ("undefined1 *", "build", "int a, int b")
+
 
 class TestStructRewrites:
     def test_rewrite_struct_types(self):
@@ -83,11 +104,27 @@ class TestStructRewrites:
     def test_struct_decls(self):
         assert dh._repair_struct_decls("dirent64 *p;") == "struct dirent64 *p;"
 
+    @pytest.mark.parametrize("name", ["stat64", "statfs64", "statvfs64"])
+    def test_64_bit_struct_calls_are_untouched(self, name):
+        text = "return %s(path, &buf);" % name
+        assert dh._repair_conflicting_struct_decls(text) == text
+
+    @pytest.mark.parametrize("name", ["stat64", "statfs64", "statvfs64"])
+    def test_64_bit_struct_declarations_are_rewritten(self, name):
+        text = "%s local;" % name
+        assert dh._repair_conflicting_struct_decls(text) == \
+            "struct %s local;" % name
+
 
 class TestReturnLastCall:
     def test_wraps_return(self):
         text = "foo(a, b);\n  return;"
         assert dh._return_last_call(text) == "return foo(a, b);"
+
+    def test_wraps_function_pointer_return_without_touching_signature(self):
+        text = "void f(code *fn)\n{\n  (*fn)(1, 2);\n  return;\n}"
+        assert dh._return_last_call(text) == \
+            "void f(code *fn)\n{\n  return (*fn)(1, 2);\n}"
 
 
 class TestMergeSplitArrayReturn:
@@ -122,8 +159,13 @@ class TestConflictingStructDecls:
 class TestArrayAssignments:
     def test_rewrites_array_assign(self):
         text = "undefined1 auVar8 [16];\n  auVar8 = foo(x);\n"
-        assert "*(undefined8 *)auVar8 = foo(x);" in \
-            dh._repair_array_assignments(text)
+        out = dh._repair_array_assignments(text)
+        assert "ghidra_copy_scalar(auVar8, foo(x)," in out
+        assert "sizeof(auVar8[0]) * (16)" in out
+
+    def test_unknown_parameter_capacity_untouched(self):
+        text = "void f(undefined1 buf[])\n{\n  buf = 1;\n}\n"
+        assert dh._repair_array_assignments(text) == text
 
     def test_index_assign_untouched(self):
         text = "undefined1 auVar8 [16];\n  auVar8[0] = 1;\n"
@@ -141,6 +183,16 @@ class TestGlobalUsage:
     def test_bitop(self):
         u = dh.collect_global_usage("x = option_mask32 & 1;")
         assert u["option_mask32"]["bitop"] >= 1
+
+    def test_bitop_preserves_global_width_and_value(self):
+        binary = {
+            "data": b"\x78\x56\x34\x12",
+            "pointer_size": 8,
+            "byteorder": "little",
+        }
+        usage = dh.collect_global_usage("return g_seed >> 16;")
+        assert dh.global_info(binary, "g_seed", 0, 4, "", usage) == \
+            ("undefined4 g_seed", "0x12345678")
 
 
 # --------------------------------------------------------------------------- #
@@ -163,6 +215,20 @@ class TestParseErrors:
     def test_warning_not_error(self):
         errs = orch.parse_errors("f.c:1:1: warning: unused\n")
         assert errs[0]["kind"] == "warning"
+
+    def test_fatal_error_without_column(self):
+        errs = orch.parse_errors("main.c:3: fatal error: missing.h: No such file\n")
+        assert errs == [{
+            "file": "main.c", "line": 3, "col": 0, "kind": "error",
+            "message": "missing.h: No such file",
+        }]
+
+    def test_linker_multiple_definition(self):
+        output = "/usr/bin/ld: b.o: in function `f':\nb.c:(.text+0x0): multiple definition of `f'; a.o:first defined here\n"
+        errs = orch.parse_errors(output)
+        assert errs[0]["kind"] == "error"
+        assert errs[0]["file"] == "b.c"
+        assert errs[0]["message"] == "multiple definition of 'f'"
 
 
 # --------------------------------------------------------------------------- #
@@ -230,6 +296,32 @@ class TestMatchNameSignature:
         assert len(params) == 3
 
 
+class TestApplyConfig:
+    def test_path_and_numeric_fields_are_converted(self, tmp_path):
+        from argparse import Namespace
+
+        args = Namespace(output_dir=None, output_file=None, project_dir=None,
+                         ghidra_dir=None, resume=None, log_file=None,
+                         parallel=0, timeout=0, max_memory=None)
+        configured = db.apply_config(args, {
+            "output_dir": str(tmp_path / "out"),
+            "output_file": str(tmp_path / "all.c"),
+            "project_dir": str(tmp_path / "projects"),
+            "ghidra_dir": str(tmp_path / "ghidra"),
+            "resume": str(tmp_path / "state.json"),
+            "log_file": str(tmp_path / "logs" / "run.log"),
+            "parallel": "3",
+            "timeout": "60",
+            "max_memory": 4096,
+        })
+        for field in ["output_dir", "output_file", "project_dir", "ghidra_dir",
+                      "resume", "log_file"]:
+            assert isinstance(getattr(configured, field), Path)
+        assert configured.parallel == 3
+        assert configured.timeout == 60
+        assert configured.max_memory == "4096"
+
+
 class TestParamTypeNames:
     def test_strips_arg_names(self):
         assert fsllm.param_type_names(["char *arg", "int base"]) == \
@@ -252,6 +344,51 @@ class TestStripCodeFence:
 
     def test_no_fence(self):
         assert llm_mod._strip_code_fence('{"a":1}') == '{"a":1}'
+
+
+class TestInferSignature:
+    def test_zero_parameter_signature_is_valid(self):
+        proposer = llm_mod.LLMProposer(api_key="test")
+        proposer._chat_json = lambda *args: {"return_type": "int", "params": []}
+        assert proposer.infer_signature("f", "int f(int x)", "", "", "") == \
+            ("int", [])
+
+
+# --------------------------------------------------------------------------- #
+# fix_argcount: 参数声明改写
+# --------------------------------------------------------------------------- #
+
+class TestRewriteParams:
+    def test_existing_names_are_preserved_when_adding(self):
+        text = "int add(int a,int b)\n{ return a+b; }\n"
+        assert fa.rewrite_params(text, "add", 3) == \
+            "int add(int a, int b, undefined8 param_3)\n{ return a+b; }\n"
+
+    def test_pointer_declaration_is_preserved(self):
+        text = "int f(char *name, unsigned long count);"
+        assert fa.rewrite_params(text, "f", 3) == \
+            "int f(char *name, unsigned long count, undefined8 param_3);"
+
+    def test_added_name_does_not_collide(self):
+        text = "int f(int param_2);"
+        assert fa.rewrite_params(text, "f", 2) == \
+            "int f(int param_2, undefined8 param_2_2);"
+
+
+class TestCollectArgVotes:
+    def test_definition_and_non_code_are_not_calls(self, tmp_path):
+        (tmp_path / "calls.c").write_text(
+            "int f(int a, int b)\n"
+            "{ return a + b; }\n"
+            "int g(void)\n"
+            "{\n"
+            "  // f(1, 2, 3)\n"
+            "  puts(\"f(1, 2, 3, 4)\");\n"
+            "  return f(1) + f(2);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        assert fa.collect_arg_votes(tmp_path, ["f"])["f"] == {1: 2}
 
 
 # --------------------------------------------------------------------------- #

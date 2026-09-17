@@ -144,7 +144,9 @@ def apply_signature(program, func, ret, params):
     from ghidra.program.model.symbol import SourceType
 
     ret = _normalize_type(ret.replace("const ", ""))
-    params_str = ", ".join(_normalize_type(p.replace("const ", "")) for p in params)
+    params_str = ", ".join(
+        _normalize_type(p.replace("const ", "")) for p in params
+    ) or "void"
     sig_str = "%s %s(%s)" % (ret, func.getName(), params_str)
 
     parser = FunctionSignatureParser(program.getDataTypeManager(), None)
@@ -255,16 +257,34 @@ def param_type_names(params):
 
 def redecompile_selected(program, funcs, output_dir, decompiler):
     """只重新反编译指定的函数集合，写到 output_dir（一函数一文件）。"""
+    output_dir = Path(output_dir)
+    paths_by_address = {}
+    for path in output_dir.glob("*.c"):
+        try:
+            header = path.read_text(encoding="utf-8", errors="replace")[:2048]
+        except OSError:
+            continue
+        match = re.search(r"(?m)^// Address:\s*(\S+)\s*$", header)
+        if match:
+            paths_by_address[match.group(1)] = path
+
+    name_counts = {}
+    for existing in program.getFunctionManager().getFunctions(True):
+        name = existing.getName()
+        name_counts[name] = name_counts.get(name, 0) + 1
+
     count = 0
     for func in funcs:
         r = decompiler.decompileFunction(func, 30, None)
         if r is None or not r.decompileCompleted():
             continue
         c_code = r.getDecompiledFunction().getC()
-        safe_name = "".join(
-            c if c.isalnum() or c in "._-" else "_" for c in func.getName()
-        )
-        path = Path(output_dir) / (safe_name + ".c")
+        address = str(func.getEntryPoint())
+        path = paths_by_address.get(address)
+        if path is None:
+            path = output_dir / db.function_output_filename(
+                func, duplicate=name_counts.get(func.getName(), 0) > 1,
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write("// Function: %s\n" % func.getName())

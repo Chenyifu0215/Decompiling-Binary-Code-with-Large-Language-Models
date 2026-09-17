@@ -66,6 +66,37 @@ def append_decl(path, decl):
     return True
 
 
+def append_header_decl(path, decl):
+    text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+    if decl in text:
+        return False
+    marker = text.rfind("#endif")
+    if marker == -1:
+        new_text = text.rstrip("\n") + "\n" + decl + "\n"
+    else:
+        new_text = text[:marker].rstrip("\n") + "\n" + decl + "\n" + text[marker:]
+    path.write_text(new_text, encoding="utf-8")
+    return True
+
+
+def add_data_symbol(binary, build_dir, name):
+    """Add a normalized object symbol declaration and initialized definition."""
+    symbol = binary.get("norm_syms", {}).get(name)
+    if symbol is None:
+        return False
+    file_offset, symbol_size = symbol
+    size = symbol_size or 16
+    declaration = "extern unsigned char %s[0x%x];" % (name, size)
+    raw = dh.read_raw(binary, file_offset, symbol_size) if symbol_size else None
+    definition = "unsigned char %s[0x%x]" % (name, size)
+    if raw is not None:
+        definition += " = {%s}" % ", ".join("0x%02x" % byte for byte in raw)
+    definition += ";"
+    header_added = append_header_decl(Path(build_dir) / "globals.h", declaration)
+    definition_added = append_decl(Path(build_dir) / "data_defs.c", definition)
+    return header_added or definition_added
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("binary")
@@ -94,7 +125,6 @@ def main():
     func_syms = binary.get("func_syms", set())
     norm_syms = binary.get("norm_syms", {})
     proto_path = build_dir / "function_prototypes.h"
-    defs_path = build_dir / "data_defs.c"
 
     n_func = n_data = n_skip = n_fallback = 0
     for name in names:
@@ -105,8 +135,7 @@ def main():
             if append_decl(proto_path, "extern undefined8 %s();" % name):
                 n_func += 1
         elif name in norm_syms:
-            size = norm_syms[name][1] or 16
-            if append_decl(defs_path, "char %s[0x%x];" % (name, size)):
+            if add_data_symbol(binary, build_dir, name):
                 n_data += 1
         else:
             if append_decl(proto_path, "extern undefined8 %s;" % name):
