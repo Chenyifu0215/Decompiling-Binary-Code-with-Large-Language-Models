@@ -1,0 +1,195 @@
+================================================================================
+项目交接文档：Ghidra 静态反编译修复（闭环）
+更新时间：2026-09-15
+================================================================================
+
+一、项目定位
+--------------------------------------------------------------------------------
+把 Ghidra 反编译出的「伪 C」（含 undefined 类型、slice 语法、缺失声明、类型混淆）
+自动改写成可编译的 C，并尽量保证功能正确。核心是「静态修复闭环」：
+
+    反编译 → 预处理 → 规则修复 → LLM 签名/类型修复 → 编译 → 失败则迭代
+    收敛判据 = 编译错误数不再显著下降（每轮收益 < 30 即停）
+
+三层目标（按难度）：
+  1. 反编译质量（让 Ghidra 输出尽可能正确的伪代码）        ← 已大量改善
+  2. 编译通过（让伪代码能编译）                            ← 当前主攻，达 85% 文件级
+  3. 功能正确（运行时行为一致）                            ← 仅函数级 demo
+
+二、核心文件清单（cleanwork/ 与 static_decompile/ 两份，内容一致）
+--------------------------------------------------------------------------------
+  【反编译】
+  decompile_binary.py     反编译（PyGhidra；自动导入 libc 类型+签名；同名函数加地址后缀；
+                          名字语义签名表：xmalloc/full_read 等跨项目通用命名；
+                          libc 别名去前缀：__isoc99_sscanf→sscanf、__GI_/__ieee754_ 等）
+  decompile_binary_usage.txt
+
+  【生成可编译工程】—— 把反编译产物改写成能过 gcc 的工程
+  decompile_helper.py     核心文本/类型修复（无 LLM），能力清单：
+                            - slice 语法      auVar3._8_8_ → *(undefined8 *)((char*)auVar3+8)
+                            - 数组赋值        arr = expr → *(undefined8 *)arr = expr
+                            - 全局变量类型推断 解引用→指针、位运算→整数（修 globals.h）
+                            - DAT_ 可写推断   被赋值的 DAT_x 声明为指针（非 const 数组）
+                            - 符号表规范化反查 dot.0 → dot_0（为取地址常量生成定义）
+                            - 导入符号过滤    .dynsym UND（libc）不生成 prototype/.c
+                            - 数组指针声明符  undefined1 (*) [16] 返回类型 → undefined1 *
+                            - struct 裸名/冲突声明、签名分行合并、同名函数 static、
+                              longlong/uchar/int3..int7/uint3..uint7 typedef、wchar.h 等
+  decompile_helper_usage.txt
+
+  【规则修复工具】（错误驱动，无 LLM，可迭代）
+  fix_undeclared.py       补未声明符号（函数指针/数据常量/类型）：读编译 log 的
+                          undeclared，查符号表 → extern 声明 / 数据定义 / 兜底
+  fix_argcount.py         调用点投票推断参数个数（众数占比 ≥90% 才采纳，排除变参），
+                          同步修 function_prototypes.h 和 .c 定义（保留原参数类型）
+  fix_binary_ops.py       指针/向量参与位运算与算术运算（* / % >> << & | ^）→ cast 成
+                          (unsigned long)（含 128 位乘除 SUB168(...)）
+  fix_conflicts.py        与系统头冲突的同名函数（如 bash 自己的 getenv）→ 从
+                          prototype.h/Makefile/目录移除（一个函数可放大几千条错误）
+
+  【LLM 修复】（需 LLM_API_KEY）
+  fix_signatures_llm.py   LLM 签名修复（证据包=伪代码+汇编+调用点+callee锚点 →
+                          LLM 推断 → 回灌 Ghidra → 重新反编译）。关键机制：
+                            --prescreen  只修编译报 too few/many 的函数
+                            --verify     修复后重新生成+编译，错误增加则整体回退
+                                         （验证时自动重跑工具链，保持口径一致）
+                            锚点回流     修好的函数加入 callee 锚点（多层类型传播）
+                            高频优先     按被调次数排序（先修高频被调函数）
+  fix_types_llm.py        LLM 类型修复（array/指针/位运算/void/called object/
+                          subscripted）→ 生成补丁修 build 的 .c；同样支持 --verify
+  fix_signatures.py       签名修复基础版（按 sigs.json 手工指定）
+  llm.py                  LLM proposer（DeepSeek 调用 + fallback 规则库）
+  patch.py                补丁引擎（replace/regex，可重放）
+  orchestrator.py         静态编译修复闭环（make -k → 补丁 → 重试）
+  decompile_gui.py        桌面 GUI（拖拽反编译+签名修复+生成工程+静态修复）
+
+  【测试】test_core.py(59) + test_golden.py + test_e2e.py = 61 用例
+
+三、当前成果（五维测试矩阵，全部实测）
+--------------------------------------------------------------------------------
+  组合              样本      函数数   基线错误   最终错误   成功编译     成功率
+  ----------------  --------  ------  --------  --------  -----------  -------
+  动态 + stripped   cat          198      2594         9       73/77     94.8%
+  动态 + stripped   bbbq         510      1788       699     394/439    89.7%
+  动态 + stripped   bash        1862     10544       899    1335/1568   85.1%
+  静态 + unstripped busybox     5245      4240       845    2260/2655   85.1%
+  静态 + stripped   busybox     4603    144599      9116    2159/4593   47.0%
+
+  现实占比（重要）：动态+stripped ~75% > 静态+stripped ~12% > 动态+unstripped ~8%
+  > 静态+unstripped <2%。
+  动态+stripped（现实最多）稳定在 85%~95%；静态+stripped（最硬）仅 47%。
+
+四、关键技术结论（新模型必读，避免走弯路）
+--------------------------------------------------------------------------------
+1.【硬边界】整二进制「完整重编译通过」在无源码下 ≈ 0%（业界共识）。
+  int / 指针 / 结构体的类型信息在机器码里物理丢失，任何静态方法（含 LLM）只能
+  「改善」不能「恢复」。目标是尽量高的编译通过率，而不是 100%。
+
+2.【动态 vs 静态链接是两个世界】
+  - 动态链接：导入表（.dynsym 的 UND 符号）保留 libc 函数名 → 是天然「锚点」，
+    还能直接注入 .gdt 签名。但必须过滤导入符号的 prototype/.c（否则与系统头冲突）。
+  - 静态链接：libc 被内联成内部函数（名字带 glibc 前缀如 __isoc23_strtoumax），
+    用 --map（.text.<name> 段白名单）过滤；LLM 签名只能靠汇编/调用点推断。
+
+3.【stripped 的影响】
+  - 所有函数名变 FUN_xxx → 名字语义表/符号表反查失效；但用法推断、slice、
+    数组赋值等「不依赖名字」的规则仍有效。
+  - 逐字节（无符号名）→ 要保证 fix_signatures_llm 的 _skip_name 不过滤 FUN_xxx，
+    否则待修函数为 0（本工程已修）。
+  - stripped 暴露出两类此前被掩盖的通用 bug：数组指针声明符、指针参与位运算。
+
+4.【LLM 迭代不是单调的——验证回退是必需项】
+  实测：busybox 第二轮签名修复 -452 变差；bash 第二轮签名 +366 变差、类型迭代
+  第 5 轮 +45 变差。没有 --verify 时「迭代 = 赌博」。
+  加了 --verify（编译错误增加则整体回退，验证时重跑工具链保证口径一致）后，
+  bash 变成单调收敛：1267→1099→1020→952→898（最后一轮被拦截回退）。
+
+5.【全局变量类型是最大错误源头】globals.h 里按数据段大小猜类型（size==8→long、
+  size>8→数组）会导致 array type / unary / binary 大量错误；改为按代码真实用法
+  （*var 解引用→指针、var&mask→整数、&var→数组）推断后，busybox 单项消除约 1000 条。
+
+6.【错误集中度极高，优先修高频】
+  - 高频被调函数（一个函数几十个调用点）：zxc_lex_next、monotonic_sec、o_addchr…
+  - 同名冲突函数：bash 4 个（getenv/setenv/unsetenv/glob_pattern_p）放大 6272 条；
+    cat 44 个 libc 导入函数放大 2500+ 条。
+  - 先修这些「放大器」，收益远大于逐条修。
+
+7.【LLM 模型选择】deepseek-chat 在签名推断上又快又准（~0.5s/函数）；
+  推理模型（v4-pro）更慢且更不准。变参函数（getopt32long 类）是签名修复天花板，
+  调用点参数数不一致时应识别并跳过。
+
+8.【工程流程顺序很重要】
+  decompile_helper 重新生成会覆盖 build 目录的规则/LLM 补丁。
+  正确顺序：反编译 → decompile_helper → fix_conflicts → 规则工具链 →
+  fix_signatures_llm --verify（改 decomp，需重新生成）→ decompile_helper →
+  fix_conflicts + 工具链 → fix_types_llm --verify 迭代（改 build）。
+  fix_signatures_llm --verify 的验证会自动重跑工具链，保证 baseline 与 after 同口径。
+
+五、已知边界 / 做不了的
+--------------------------------------------------------------------------------
+  - 整二进制自动编译通过（无源码）。
+  - 跳转表（UNRECOVERED_JUMPTABLE，Ghidra 输出 switchD_x::switchdataD_y）。
+  - 深度类型推断：array type、long 当指针、结构体字段语义名、int 有符号性
+    （bash 剩余约 899 条里的大头）。
+  - 变参函数签名（LLM 推断天花板）。
+  - 功能正确性（运行时行为）未系统验证，仅函数级 demo。
+
+六、待办 / 下一步（按优先级）
+--------------------------------------------------------------------------------
+  1.【桩化 stub】编译不过的函数降级成空实现，让整个项目能链接成「可运行的部分
+    二进制」→ 从「文件级」升级到「二进制级动态验证」的入口。最推荐。
+  2. 对 bbbq 用 --verify 全程重跑（当前 699 是旧流程结果）。
+  3. 多层类型传播：把 --verify 通过的函数动态加回锚点（跨轮累积）。
+  4. fallback 规则库扩展：把类型名重写/结构体模式沉淀成规则，减少 LLM 依赖。
+  5. 动态验证补全：函数级 harness 框架化（单函数+测试 main → 编译运行对比）。
+  6. 跳转表处理（LLM 或手工）。
+  7. 测试补全：闭环端到端（orchestrator 收敛）、动态验证端到端。
+
+七、使用方式（关键命令，以 测试/bash 为例）
+--------------------------------------------------------------------------------
+  # 环境变量
+  export LLM_API_KEY=...                      # LLM 必需
+  export GHIDRA_INSTALL_DIR=...               # 可选，默认 C:/ghidra/ghidra12.1
+  export GHIDRA_SIG_PROJECTS=busybox          # 可选：启用 bb_* 项目签名表
+
+  # 完整流程
+  python decompile_binary.py 测试/bash -o 测试/bash_work2
+  python decompile_helper.py all 测试/bash 测试/bash_work2/bash_decomp \
+      -o 测试/bash_build2
+  python fix_conflicts.py 测试/bash_build2
+  python fix_undeclared.py 测试/bash 测试/bash_build2
+  python fix_argcount.py 测试/bash_build2
+  python fix_binary_ops.py 测试/bash_build2
+  python fix_signatures_llm.py 测试/bash --prescreen --verify \
+      --build-dir 测试/bash_build2 -o 测试/bash_work2/bash_decomp
+  python decompile_helper.py all 测试/bash 测试/bash_work2/bash_decomp \
+      -o 测试/bash_build2
+  python fix_conflicts.py 测试/bash_build2
+  python fix_undeclared.py 测试/bash 测试/bash_build2
+  python fix_argcount.py 测试/bash_build2
+  python fix_binary_ops.py 测试/bash_build2
+  # 迭代以下命令，直到每轮收益 < 30
+  python fix_types_llm.py 测试/bash 测试/bash_work2/bash_decomp \
+      --build-dir 测试/bash_build2 --verify
+  # 编译统计
+  wsl make -k -C 测试/bash_build2 -j
+
+  # 测试
+  python -m pytest test_core.py test_golden.py test_e2e.py -q    # 61 passed
+
+八、环境依赖
+--------------------------------------------------------------------------------
+  - Python 3.12 + PyGhidra（Ghidra 12.1 安装）+ PySide6（GUI）
+  - GHIDRA_INSTALL_DIR 或默认 C:/ghidra/ghidra12.1
+  - WSL（Windows 下 make/gcc 编译）
+  - LLM_API_KEY（DeepSeek）
+  - 测试二进制：测试/cat、测试/bash、测试/bbbq（动态+stripped）、
+    测试/busybox_unstripped（静态+unstripped）+ .map、测试/busybox（静态+stripped）
+
+九、Git 工作流（重要）
+--------------------------------------------------------------------------------
+  - 主仓库：static_decompile/（本地 Git，main 分支）
+  - 远端：https://github.com/Chenyifu0215/Decompiling-Binary-Code-with-Large-Language-Models
+  - 规则：**所有修改只提交到本地 Git；只有明确指示才 push 到远端。**
+  - 文档：static_decompile/work.txt（用法）、result.txt（各阶段成果）
+================================================================================
