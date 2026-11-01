@@ -107,6 +107,8 @@ Ghidra:
   --ghidra-dir PATH     Ghidra 安装目录
   --project-dir DIR     Ghidra 项目目录
   --project-name NAME   Ghidra 项目名称
+  --reuse-project       复用已分析的同 MD5 程序（默认）
+  --no-reuse-project    强制重新导入并分析
 
 调试:
   -v, --verbose         详细输出

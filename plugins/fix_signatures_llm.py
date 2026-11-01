@@ -12,6 +12,7 @@
 """
 
 import argparse
+import concurrent.futures
 import logging
 import re
 import sys
@@ -330,6 +331,10 @@ def main():
                     help="prescreen 用的 build 目录（--prescreen 时必需）")
     ap.add_argument("--max-functions", type=int, default=0,
                     help="最多处理 N 个函数（0=全部）")
+    ap.add_argument("--decompiler-workers", type=int, default=0,
+                    help="重新反编译时的并行 worker 数（0=自动，1=顺序）")
+    ap.add_argument("--llm-workers", type=int, default=4,
+                    help="同一批内并发 LLM 签名推断数（Ghidra 操作仍串行）")
     ap.add_argument("--no-sort", action="store_true",
                     help="不按被调次数排序（默认优先修高频被调函数）")
     ap.add_argument("--verify", action="store_true",
@@ -343,7 +348,13 @@ def main():
     ap.add_argument("--base-url", default=None)
     ap.add_argument("--api-key", default=None)
     ap.add_argument("--ghidra-dir", type=Path, default=None)
+    ap.add_argument("--project-dir", default=None,
+                    help="Ghidra project directory (default: binary directory)")
+    ap.add_argument("--project-name", default=None,
+                    help="Ghidra project name (default: <binary>_ghidra_decomp)")
     ap.add_argument("--no-analyze", action="store_true")
+    ap.add_argument("--no-reuse", action="store_true",
+                    help="Force re-import and re-analysis instead of reusing the project")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -359,7 +370,13 @@ def main():
         sys.exit(1)
 
     db.start_ghidra(args.ghidra_dir, verbose=False)
-    project, program, primary = db.load_binary(args.binary, analyze=not args.no_analyze)
+    project, program, primary = db.load_binary(
+        args.binary,
+        project_dir=args.project_dir,
+        project_name=args.project_name,
+        analyze=not args.no_analyze,
+        reuse=not args.no_reuse,
+    )
 
     from ghidra.app.decompiler import DecompInterface, DecompileOptions
     decompiler = DecompInterface()
@@ -391,47 +408,91 @@ def main():
         funcs = funcs[:args.max_functions]
     LOG.info("待处理函数数: %d（锚点数 %d）", len(funcs), len(anchors))
 
+    def infer_one(item):
+        i, func, name, current_sig, c_code, asm, xrefs, callee_ctx = item
+        inferred = llm.infer_signature(name, current_sig, c_code, asm, xrefs,
+                                       callee_ctx=callee_ctx or None)
+        if inferred is None and slow_llm is not None:
+            inferred = slow_llm.infer_signature(name, current_sig, c_code, asm,
+                                                xrefs, callee_ctx=callee_ctx or None)
+        return inferred
+
     ok_count = 0
     fail_count = 0
     skip_count = 0
     changed = []
     backup = {}
+    llm_workers = max(1, args.llm_workers)
+    if llm_workers > 1:
+        LOG.info("LLM 并发请求数: %d（按批回灌签名）", llm_workers)
     try:
-        for i, func in enumerate(funcs, 1):
-            name = func.getName()
-            current_sig = str(func.getSignature())
-            try:
-                c_code, asm, xrefs = export_evidence(program, func, decompiler, listing)
-                callee_ctx = export_callee_anchors(program, func, listing, anchors)
-            except Exception as e:
-                LOG.warning("[%d/%d] %s: 证据导出失败 %s", i, len(funcs), name, e)
-                skip_count += 1
+        for batch_start in range(0, len(funcs), llm_workers):
+            batch = funcs[batch_start:batch_start + llm_workers]
+            prepared = []
+            for offset, func in enumerate(batch):
+                i = batch_start + offset + 1
+                name = func.getName()
+                current_sig = str(func.getSignature())
+                try:
+                    c_code, asm, xrefs = export_evidence(
+                        program, func, decompiler, listing
+                    )
+                    callee_ctx = export_callee_anchors(
+                        program, func, listing, anchors
+                    )
+                except Exception as e:
+                    LOG.warning("[%d/%d] %s: 证据导出失败 %s", i, len(funcs), name, e)
+                    skip_count += 1
+                    continue
+                prepared.append(
+                    (i, func, name, current_sig, c_code, asm, xrefs, callee_ctx)
+                )
+
+            if not prepared:
                 continue
 
-            inferred = llm.infer_signature(name, current_sig, c_code, asm, xrefs,
-                                           callee_ctx=callee_ctx or None)
-            if inferred is None and slow_llm is not None:
-                LOG.info("[%d/%d] %s: 快模型无结果，慢模型重试", i, len(funcs), name)
-                inferred = slow_llm.infer_signature(name, current_sig, c_code, asm,
-                                                    xrefs, callee_ctx=callee_ctx or None)
-            if inferred is None:
-                LOG.warning("[%d/%d] %s: LLM 推断失败/无结果", i, len(funcs), name)
-                skip_count += 1
-                continue
-
-            ret, params = inferred
-            ok, err = apply_signature(program, func, ret, params)
-            if ok:
-                ok_count += 1
-                changed.append(func)
-                # 锚点回流：修好的函数加入 anchors，后续函数调用它时可做
-                # 多层类型传播（第一轮只有 libc 锚点，这里逐层扩充）。
-                anchors[func.getName()] = param_type_names(params)
-                LOG.info("[%d/%d] %s: %s -> %s %s(%s)",
-                         i, len(funcs), name, current_sig, ret, name, ", ".join(params))
+            if llm_workers == 1 or len(prepared) == 1:
+                inferred_list = []
+                for item in prepared:
+                    try:
+                        inferred_list.append(infer_one(item))
+                    except Exception as e:
+                        LOG.warning("%s: LLM 调用失败 %s", item[2], e)
+                        inferred_list.append(None)
             else:
-                fail_count += 1
-                LOG.warning("[%d/%d] %s: 回灌失败 %s", i, len(funcs), name, err)
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(llm_workers, len(prepared))
+                ) as executor:
+                    futures = [executor.submit(infer_one, item) for item in prepared]
+                    inferred_list = []
+                    for future in futures:
+                        try:
+                            inferred_list.append(future.result())
+                        except Exception as e:
+                            LOG.warning("LLM 调用失败: %s", e)
+                            inferred_list.append(None)
+
+            for item, inferred in zip(prepared, inferred_list):
+                i, func, name, current_sig = item[0], item[1], item[2], item[3]
+                if inferred is None:
+                    LOG.warning("[%d/%d] %s: LLM 推断失败/无结果", i, len(funcs), name)
+                    skip_count += 1
+                    continue
+
+                ret, params = inferred
+                ok, err = apply_signature(program, func, ret, params)
+                if ok:
+                    ok_count += 1
+                    changed.append(func)
+                    # 锚点回流：修好的函数加入 anchors，后续函数调用它时可做
+                    # 多层类型传播（第一轮只有 libc 锚点，这里逐层扩充）。
+                    anchors[func.getName()] = param_type_names(params)
+                    LOG.info("[%d/%d] %s: %s -> %s %s(%s)",
+                             i, len(funcs), name, current_sig, ret, name,
+                             ", ".join(params))
+                else:
+                    fail_count += 1
+                    LOG.warning("[%d/%d] %s: 回灌失败 %s", i, len(funcs), name, err)
     finally:
         pass
 
@@ -457,7 +518,13 @@ def main():
                     backup[str(_fp)] = _fp.read_text(encoding="utf-8", errors="replace")
         LOG.info("重新反编译 %d 个函数（被改 %d + 调用者）",
                  len(to_redecompile), len(changed))
-        count = redecompile_selected(program, to_redecompile, args.output_dir, decompiler)
+        addrs = [str(f.getEntryPoint()) for f in to_redecompile]
+        count, _ = db.decompile_all_functions(
+            program,
+            output_dir=args.output_dir,
+            function_list=addrs,
+            workers=args.decompiler_workers,
+        )
         LOG.info("已重新反编译 %d 个函数 -> %s", count, args.output_dir)
 
     if args.verify and baseline is not None and backup and args.build_dir:

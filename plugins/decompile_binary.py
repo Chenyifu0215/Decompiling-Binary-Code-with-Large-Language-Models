@@ -639,6 +639,50 @@ def _import_named_signatures(program, projects=None) -> int:
     return applied
 
 
+class _ReusedPrimary:
+    """Minimal wrapper matching the PyGhidra Loaded interface used by callers."""
+
+    def __init__(self, program, consumer):
+        self._program = program
+        self._consumer = consumer
+
+    def getDomainObject(self):
+        return self._program
+
+    def close(self):
+        if self._consumer is not None:
+            self._program.release(self._consumer)
+
+
+def _find_reusable_program(project, binary: Path):
+    import pyghidra
+    from ghidra.framework.model import ProjectDataUtils
+
+    try:
+        want_md5 = hashlib.md5(binary.read_bytes()).hexdigest().lower()
+    except OSError:
+        return None
+
+    root = project.getProjectData().getRootFolder()
+    for domain_file in ProjectDataUtils.descendantFiles(root):
+        if domain_file.getName() != binary.name:
+            continue
+        program = None
+        consumer = None
+        try:
+            program, consumer = pyghidra.consume_program(
+                project, domain_file.getPathname()
+            )
+            got_md5 = (program.getExecutableMD5() or "").lower()
+            if got_md5 == want_md5:
+                return program, consumer
+        except Exception:
+            pass
+        if program is not None and consumer is not None:
+            program.release(consumer)
+    return None
+
+
 def load_binary(
     binary_path: str,
     project_dir: Optional[str] = None,
@@ -646,6 +690,8 @@ def load_binary(
     lang_id: Optional[str] = None,
     compiler_id: Optional[str] = None,
     analyze: bool = True,
+    reuse: bool = False,
+    save_project: bool = True,
 ):
     import pyghidra
 
@@ -660,23 +706,45 @@ def load_binary(
 
     logging.info("Opening project: %s", proj_dir / proj_name)
 
-    project = pyghidra.open_project(str(proj_dir), proj_name, create=True)
+    from ghidra.base.project import GhidraProject
+    from ghidra.framework.model import ProjectLocator
+    from pyghidra.core import _get_language, _get_compiler_spec
+    from java.io import File
 
-    loader = pyghidra.program_loader()
-    loader.name(binary.name)
-    loader.source(str(binary))
+    if ProjectLocator(str(proj_dir), proj_name).exists():
+        project = GhidraProject.openProject(str(proj_dir), proj_name, True)
+    else:
+        project = GhidraProject.createProject(str(proj_dir), proj_name, False)
 
-    if lang_id:
-        loader.language(lang_id)
-        if compiler_id:
-            loader.compiler(compiler_id)
+    if reuse:
+        reused = _find_reusable_program(project, binary)
+        if reused is not None:
+            program, consumer = reused
+            logging.info("Reusing analyzed program: %s", program.getName())
+            logging.info("  Language:   %s", program.getLanguageID().getIdAsString())
+            logging.info(
+                "  Compiler:   %s",
+                program.getCompilerSpec().getCompilerSpecID().getIdAsString(),
+            )
+            logging.info("  MD5:        %s", program.getExecutableMD5())
+            logging.info("  Image base: %s", program.getImageBase())
+            return project, program, _ReusedPrimary(program, consumer)
 
     logging.info("Importing: %s", binary)
+    try:
+        binary_file = File(str(binary))
+        if lang_id:
+            lang = _get_language(lang_id)
+            comp = _get_compiler_spec(lang, compiler_id)
+            program = project.importProgram(binary_file, lang, comp)
+        else:
+            program = project.importProgram(binary_file)
+    except Exception as e:
+        project.close()
+        raise RuntimeError(f"Failed to import {binary}: {e}") from e
 
-    load_results = loader.load()
-    primary = load_results.getPrimary()
-    program = primary.getDomainObject()
     if program is None:
+        project.close()
         raise RuntimeError(f"Failed to import {binary}")
 
     logging.info("Program loaded: %s", program.getName())
@@ -697,7 +765,10 @@ def load_binary(
 
     import_libc_types(program)
 
-    return project, program, primary
+    if save_project:
+        project.saveAs(program, "/", binary.name, True)
+
+    return project, program, _ReusedPrimary(program, None)
 
 
 def decompile_function(program, func, decompiler) -> Optional[str]:
@@ -1019,6 +1090,7 @@ def decompile_single_file(
             lang_id=args.lang,
             compiler_id=args.compiler,
             analyze=not args.no_analyze,
+            reuse=args.reuse_project,
         )
     except Exception as e:
         logging.error("Failed to load binary %s: %s", filename, e)
@@ -1151,6 +1223,7 @@ def _worker_decompile(
             lang_id=a.lang,
             compiler_id=a.compiler,
             analyze=not a.no_analyze,
+            reuse=a.reuse_project,
         )
 
         try:
@@ -1219,6 +1292,7 @@ def _run_worker_once(
             "meta",
             "functions",
             "decompiler_workers",
+            "reuse_project",
             "verbose",
             "max_memory",
         )
@@ -1638,6 +1712,19 @@ Examples:
     ghidra_group.add_argument(
         "--project-name",
         help="Name for Ghidra project (default: derived from binary name)",
+    )
+    ghidra_group.add_argument(
+        "--reuse-project",
+        dest="reuse_project",
+        action="store_true",
+        default=True,
+        help="Reuse an existing analyzed program with the same MD5 (default)",
+    )
+    ghidra_group.add_argument(
+        "--no-reuse-project",
+        dest="reuse_project",
+        action="store_false",
+        help="Always re-import and analyze the binary",
     )
 
     debug_group = parser.add_argument_group("Debug")

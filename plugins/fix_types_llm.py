@@ -9,6 +9,7 @@
 """
 
 import argparse
+import concurrent.futures
 import logging
 import platform
 import subprocess
@@ -86,6 +87,8 @@ def main():
     ap.add_argument("decomp_dir", help="反编译 .c 目录")
     ap.add_argument("--build-dir", required=True, help="build 目录")
     ap.add_argument("--max-functions", type=int, default=0)
+    ap.add_argument("--llm-workers", type=int, default=4,
+                    help="Concurrent LLM requests while keeping Ghidra access serial")
     ap.add_argument("--verify", action="store_true",
                     help="修复后编译验证，错误总数增加则整体回退")
     ap.add_argument("--model", default=None)
@@ -93,7 +96,13 @@ def main():
     ap.add_argument("--base-url", default=None)
     ap.add_argument("--api-key", default=None)
     ap.add_argument("--ghidra-dir", type=Path, default=None)
+    ap.add_argument("--project-dir", default=None,
+                    help="Ghidra project directory (default: binary directory)")
+    ap.add_argument("--project-name", default=None,
+                    help="Ghidra project name (default: <binary>_ghidra_decomp)")
     ap.add_argument("--no-analyze", action="store_true")
+    ap.add_argument("--no-reuse", action="store_true",
+                    help="Force re-import and re-analysis instead of reusing the project")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -109,7 +118,13 @@ def main():
         sys.exit(1)
 
     db.start_ghidra(args.ghidra_dir, verbose=False)
-    project, program, primary = db.load_binary(args.binary, analyze=not args.no_analyze)
+    project, program, primary = db.load_binary(
+        args.binary,
+        project_dir=args.project_dir,
+        project_name=args.project_name,
+        analyze=not args.no_analyze,
+        reuse=not args.no_reuse,
+    )
 
     from ghidra.app.decompiler import DecompInterface, DecompileOptions
     decompiler = DecompInterface()
@@ -136,8 +151,15 @@ def main():
         LOG.info("修复前错误数: %d", baseline)
     backup = {}
 
-    fixed = 0
-    failed = 0
+    def infer_patches(task):
+        fname, name, c_code, asm, xrefs, file_errs = task
+        patches = llm.infer_type_fixes(name, c_code, asm, xrefs, file_errs)
+        if patches is None and slow_llm is not None:
+            patches = slow_llm.infer_type_fixes(name, c_code, asm, xrefs, file_errs)
+        return patches
+
+    # 第一阶段：串行访问 Ghidra，准备每个文件的证据包。
+    tasks = []
     processed = 0
     for fname, file_errs in sorted(by_file.items()):
         if args.max_functions and processed >= args.max_functions:
@@ -181,9 +203,37 @@ def main():
         else:
             c_code = export_evidence(program, func, decompiler, listing)[0]
 
-        patches = llm.infer_type_fixes(name, c_code, asm, xrefs, file_errs)
-        if patches is None and slow_llm is not None:
-            patches = slow_llm.infer_type_fixes(name, c_code, asm, xrefs, file_errs)
+        tasks.append((fname, name, c_code, asm, xrefs, file_errs))
+
+    # 第二阶段：LLM 请求并发执行；Ghidra 和文件补丁仍在主线程串行。
+    results = []
+    workers = max(1, args.llm_workers)
+    if workers == 1:
+        for task in tasks:
+            try:
+                results.append((task, infer_patches(task)))
+            except Exception as e:
+                LOG.warning("%s: LLM 调用失败 %s", task[1], e)
+                results.append((task, None))
+    else:
+        LOG.info("LLM 并发请求数: %d", workers)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(infer_patches, task): task for task in tasks
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                task = future_map[future]
+                try:
+                    results.append((task, future.result()))
+                except Exception as e:
+                    LOG.warning("%s: LLM 调用失败 %s", task[1], e)
+                    results.append((task, None))
+
+    # 第三阶段：串行应用补丁。
+    fixed = 0
+    failed = 0
+    for idx, (task, patches) in enumerate(results, 1):
+        fname, name, c_code, asm, xrefs, file_errs = task
         if not patches:
             failed += 1
             LOG.warning("%s: LLM 无补丁", name)
@@ -202,7 +252,7 @@ def main():
         applied, app_errs = apply_patch_list(str(build_dir), patches)
         if applied:
             fixed += 1
-            LOG.info("[%d/%d] %s: 应用 %d 个补丁", processed, len(by_file), name, applied)
+            LOG.info("[%d/%d] %s: 应用 %d 个补丁", idx, len(results), name, applied)
         else:
             failed += 1
             LOG.warning("%s: 补丁应用失败 %s", name, app_errs)

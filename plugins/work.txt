@@ -48,8 +48,8 @@ Ghidra 静态反编译修复工程 - 使用说明 (work.txt)
 
 四、完整流程（推荐）
 --------------------------------------------------------------------------------
-  # 1. 反编译（含 libc 类型/签名自动导入）
-  python decompile_binary.py <binary> -o <work>
+  # 1. 反编译（含 libc 类型/签名自动导入；默认复用已分析项目）
+  python decompile_binary.py <binary> -o <work> --decompiler-workers 4
 
   # 2. 生成可编译工程（含 libc 过滤）
   python decompile_helper.py all <binary> <work>/<stem>_decomp \
@@ -57,7 +57,8 @@ Ghidra 静态反编译修复工程 - 使用说明 (work.txt)
 
   # 3. LLM 签名修复（预筛只修报错的，省成本）
   python fix_signatures_llm.py <binary> --prescreen \
-      --build-dir <work>/<stem>_build -o <work>/<stem>_decomp
+      --build-dir <work>/<stem>_build -o <work>/<stem>_decomp \
+      --llm-workers 4 --decompiler-workers 4
 
   # 4. 重新生成工程
   python decompile_helper.py all <binary> <work>/<stem>_decomp \
@@ -65,7 +66,7 @@ Ghidra 静态反编译修复工程 - 使用说明 (work.txt)
 
   # 5. LLM 类型修复
   python fix_types_llm.py <binary> <work>/<stem>_decomp \
-      --build-dir <work>/<stem>_build
+      --build-dir <work>/<stem>_build --llm-workers 4
 
   # 6. 错误驱动补全未声明符号（可重复执行直到 undeclared 收敛）
   python fix_undeclared.py <binary> <work>/<stem>_build
@@ -87,7 +88,10 @@ Ghidra 静态反编译修复工程 - 使用说明 (work.txt)
     --lang            Ghidra 语言 ID（如 x86:LE:64:default，一般自动识别）
     --no-analyze      跳过自动分析
     --functions NAME  只反编译指定函数
-    --parallel N      并行度（0=顺序）
+    --parallel N      文件级并行度（0=顺序）
+    --decompiler-workers N  单二进制内函数级并行反编译（0=自动最多4，1=顺序）
+    --reuse-project   复用已分析的同 MD5 程序（默认）
+    --no-reuse-project 强制重新导入并分析
 
   说明：自动导入 generic_clib_64.gdt 的 libc 类型+签名（含 __isoc*/__GI*
   别名去前缀）；同名函数输出时加地址后缀避免覆盖。
@@ -127,6 +131,9 @@ Ghidra 静态反编译修复工程 - 使用说明 (work.txt)
     --functions NAME..  只处理指定函数名
     --max-functions N   最多处理 N 个
     --no-sort          不按被调次数排序（默认优先修高频被调函数）
+    --llm-workers N     同一批内并发 LLM 推断数（默认 4，Ghidra 操作仍串行）
+    --decompiler-workers N  重新反编译的并行 worker 数（0=自动最多4）
+    --no-reuse          强制重新导入分析（默认复用已保存项目）
     --model            快模型（默认 deepseek-chat）
     --slow-model       慢模型兜底（对快模型失败的重试）
 
@@ -139,6 +146,8 @@ Ghidra 静态反编译修复工程 - 使用说明 (work.txt)
   关键参数：
     --build-dir        （必需）build 目录
     --max-functions N  最多处理 N 个
+    --llm-workers N    并发 LLM 请求数（默认 4，Ghidra 证据导出仍串行）
+    --no-reuse         强制重新导入分析（默认复用已保存项目）
     --model/--slow-model 同上
 
   修复：array type / 指针当整数 / 位运算类型不匹配 / invalid use of void。
