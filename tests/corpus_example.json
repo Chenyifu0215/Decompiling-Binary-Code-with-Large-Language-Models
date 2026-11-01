@@ -1,0 +1,39 @@
+{
+  "out_dir": "ignore/generated/corpus",
+  "configs": [
+    {"name": "dyn-O2", "cflags": ["-O2"]},
+    {"name": "dyn-O0", "cflags": ["-O0"]},
+    {"name": "dyn-O2-nopie", "cflags": ["-O2", "-no-pie", "-fno-pie"]},
+    {"name": "static-O2", "cflags": ["-O2"], "static": true}
+  ],
+  "jobs": [
+    {
+      "name": "stress_t1_switch",
+      "type": "single_file",
+      "sources": ["tests/samples/stress/t1_switch.c"],
+      "cflags": ["-Wall"]
+    },
+    {
+      "name": "stress_t2_types",
+      "type": "single_file",
+      "sources": ["tests/samples/stress/t2_types.c"],
+      "cflags": ["-Wall"]
+    },
+    {
+      "name": "stress_t3_calls",
+      "type": "single_file",
+      "sources": ["tests/samples/stress/t3_calls.c"],
+      "cflags": ["-Wall"]
+    },
+    {
+      "name": "stress_t4_multi",
+      "type": "single_file",
+      "sources": [
+        "tests/samples/stress/t4_main.c",
+        "tests/samples/stress/t4_a.c",
+        "tests/samples/stress/t4_b.c"
+      ],
+      "cflags": ["-Wall"]
+    }
+  ]
+}

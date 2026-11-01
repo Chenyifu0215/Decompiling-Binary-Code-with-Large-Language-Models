@@ -6,7 +6,8 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "plugins"))
 
 import pytest
 
@@ -14,7 +15,9 @@ import decompile_helper as dh
 import orchestrator as orch
 import patch as patch_mod
 import llm as llm_mod
+import fix_argcount as fa
 import fix_signatures_llm as fsllm
+import fix_undeclared as fu
 import decompile_binary as db
 
 
@@ -33,6 +36,192 @@ class TestSliceSyntax:
 
     def test_unknown_size_untouched(self):
         assert dh._repair_slice_syntax("a._16_16_ = z;") == "a._16_16_ = z;"
+
+    def test_scalar_base_uses_address(self):
+        out = dh._repair_slice_syntax("undefined8 local_198;\nreturn local_198._1_7_;")
+        assert "(char *)&local_198 + 1" in out
+
+    def test_non_power_of_two_assign_is_rmw(self):
+        out = dh._repair_slice_syntax(
+            "undefined8 local_198;\nlocal_198._1_7_ = (undefined7)(x >> 8);")
+        assert ("*(unsigned long long *)((char *)&local_198 + 1) = "
+                "(*(unsigned long long *)((char *)&local_198 + 1) & "
+                "~0xffffffffffffffULL) | "
+                "((unsigned long long)((undefined7)(x >> 8)) & "
+                "0xffffffffffffffULL);") in out
+
+    def test_member_chain_base(self):
+        out = dh._repair_slice_syntax("x = pStack_360.__sd.__val[0]._4_4_;")
+        assert ("*(undefined4 *)((char *)&(pStack_360.__sd.__val[0]) + 4)"
+                in out)
+
+    def test_non_power_of_two_read_is_masked(self):
+        out = dh._repair_slice_syntax("undefined8 local_198;\nreturn local_198._2_6_;")
+        assert ("(*(unsigned long long *)((char *)&local_198 + 2) & "
+                "0xffffffffffffULL)") in out
+
+    def test_wide_slice_copy_memcpy(self):
+        out = dh._repair_slice_syntax(
+            "void f(void) {\n  undefined1 auVar1 [16];\n  undefined1 auVar2 [16];\n"
+            "  auVar1._0_12_ = auVar2._0_12_;\n}")
+        assert "memcpy((char *)auVar1 + 0, (char *)auVar2 + 0, 12);" in out
+
+    def test_wide_slice_from_array_memcpy(self):
+        out = dh._repair_slice_syntax(
+            "void f(void) {\n  undefined1 auVar1 [16];\n  undefined1 auVar2 [16];\n"
+            "  auVar1._0_12_ = auVar2;\n}")
+        assert "memcpy((char *)auVar1 + 0, auVar2, 12);" in out
+
+
+class TestQualifiedNames:
+    def test_sanitize_function(self):
+        assert dh.sanitize_qualified_names(
+            "int switchD_0010164e::caseD_0(int param_1)") == \
+            "int switchD_0010164e_caseD_0(int param_1)"
+
+    def test_sanitize_switchdata_ref(self):
+        assert dh.sanitize_qualified_names(
+            "p = &switchD_0010164e::switchdataD_00104020;") == \
+            "p = &switchD_0010164e_switchdataD_00104020;"
+
+
+class TestCodeCasts:
+    def test_naked_code_cast(self):
+        assert dh._repair_code_casts("x = (code)0x0;") == "x = (code *)0x0;"
+
+    def test_pointer_cast_untouched(self):
+        assert dh._repair_code_casts("x = (code *)0x0;") == "x = (code *)0x0;"
+
+    def test_case_pointer_to_integer(self):
+        assert dh._repair_code_casts("case (code *)0x0:") == \
+            "case (unsigned long)0x0:"
+
+    def test_case_multi_pointer_to_integer(self):
+        assert dh._repair_code_casts("case (ulonglong ******)0x0:") == \
+            "case (unsigned long)0x0:"
+
+
+class TestAnonFuncTypes:
+    def test_maps_to_code(self):
+        assert dh._repair_anon_func_types(
+            "extern int atexit(_func_5014 *param_1);") == \
+            "extern int atexit(code *param_1);"
+
+    def test_named_identifier_untouched(self):
+        text = "int my_func_12(void);"
+        assert dh._repair_anon_func_types(text) == text
+
+
+class TestFuncPtrArrays:
+    def test_indexed_funcptr_decl_becomes_array(self):
+        text = "code *local_60;\nlocal_60[3] = x;"
+        assert "code *local_60[1];" in dh._repair_funcptr_arrays(text)
+
+    def test_unindexed_untouched(self):
+        text = "code *fn;\n(*fn)(1);"
+        assert dh._repair_funcptr_arrays(text) == text
+
+
+class TestArgcountRewrite:
+    def test_array_param_preserved(self):
+        text = ("void FUN(undefined1 param_1 [16],size_t param_2,"
+                "undefined8 *param_3);")
+        out = fa.rewrite_params(text, "FUN", 2)
+        assert "undefined1 param_1[16], size_t param_2" in out
+
+    def test_function_pointer_param_not_split(self):
+        text = "void g(void (*cb)(int,int),int x);"
+        out = fa.rewrite_params(text, "g", 2)
+        assert "void (*cb)(int,int)" in out
+
+
+class TestDataPtrParams:
+    def test_code_ptr_used_as_data(self):
+        params = "ulong param_1,code *param_2,code *param_3"
+        body = "x = (uint)param_3; y = param_2[4];"
+        out = dh._fix_data_ptr_params(params, body)
+        assert "undefined1 *param_3" in out
+        assert "undefined1 *param_2" in out
+
+    def test_function_pointer_untouched(self):
+        params = "code *param_1"
+        assert dh._fix_data_ptr_params(params, "(*param_1)();") == params
+
+
+class TestTypeAliases:
+    def test_sigaltstack_cast(self):
+        assert dh._repair_type_aliases("x = (sigaltstack *)0x0;") == \
+            "x = (stack_t *)0x0;"
+
+    def test_sigaltstack_decl(self):
+        assert dh._repair_type_aliases("sigaltstack local_88;") == \
+            "stack_t local_88;"
+
+
+class TestWidenPointerLocals:
+    def test_indexed_scalar_becomes_pointer(self):
+        text = "undefined4 local_1c;\nlocal_1c[1] = 0;"
+        assert "undefined4 *local_1c;" in dh._widen_pointer_locals(text)
+
+    def test_cast_assigned_scalar_becomes_pointer(self):
+        text = "undefined4 local_1c;\nlocal_1c = (undefined4 *)p;"
+        assert "undefined4 *local_1c;" in dh._widen_pointer_locals(text)
+
+    def test_plain_scalar_untouched(self):
+        text = "undefined4 local_1c;\nlocal_1c = 1;"
+        assert dh._widen_pointer_locals(text) == text
+
+
+class TestArrayCasts:
+    def test_rhs_array_cast_to_integer(self):
+        assert dh._repair_array_casts("x = (char [8])0x1234;") == \
+            "x = (unsigned long long)0x1234;"
+
+    def test_array_lvalue_cast(self):
+        out = dh._repair_array_casts("*(char (*) [8])(p + 6) = v;")
+        assert out == "*(unsigned long long *)(p + 6) = v;"
+
+
+class TestAggregateCasts:
+    def test_union_local_gets_address(self):
+        text = ("void f(void) {\n  _union_1457 local_b00;\n"
+                "  *(undefined4 *)((char *)local_b00 + 0) = 0;\n}")
+        out = dh._repair_aggregate_casts(text)
+        assert "(char *)&local_b00 + 0" in out
+
+    def test_existing_address_untouched(self):
+        text = ("void f(void) {\n  _union_1457 local_b00;\n"
+                "  x = (char *)&local_b00;\n}")
+        assert dh._repair_aggregate_casts(text) == text
+
+    def test_array_untouched(self):
+        text = "void f(void) {\n  int arr[4];\n  x = (char *)arr;\n}"
+        assert dh._repair_aggregate_casts(text) == text
+
+
+class TestTypesTemplate:
+    def test_includes_elf_h(self):
+        assert "#include <elf.h>" in dh.GHIDRA_TYPES_TEMPLATE
+
+    def test_defines_destr_function(self):
+        assert "__destr_function" in dh.GHIDRA_TYPES_TEMPLATE
+
+
+class TestUndefinedRefs:
+    def test_collect_link_errors(self):
+        log = (
+            "collect2: error: ld returned 1 exit status\n"
+            "(.text+0x1b): undefined reference to `pcRam0000000000105048'\n"
+            "FUN_x.c:(.text+0x45): undefined reference to "
+            "`pcRam0000000000105048'\n"
+            "/usr/bin/ld: x.c:(.text): undefined reference to `CONCAT71'\n"
+        )
+        assert fu.collect_undefined_refs(log) == [
+            "pcRam0000000000105048", "CONCAT71"]
+
+    def test_collect_excludes_known(self):
+        log = "undefined reference to `foo'\nundefined reference to `bar'\n"
+        assert fu.collect_undefined_refs(log, exclude={"foo"}) == ["bar"]
 
 
 class TestStackRefs:
@@ -81,11 +270,33 @@ class TestStructRewrites:
     def test_struct_decls(self):
         assert dh._repair_struct_decls("dirent64 *p;") == "struct dirent64 *p;"
 
+    def test_passwd_declaration_rewritten(self):
+        assert dh._repair_struct_decls("passwd pw;") == "struct passwd pw;"
+
+    def test_passwd_pointer_declaration(self):
+        assert dh._repair_struct_decls("passwd *pw;") == "struct passwd *pw;"
+
+    def test_passwd_identifier_untouched(self):
+        text = "x = passwd + 1;"
+        assert dh._repair_struct_decls(text) == text
+
 
 class TestReturnLastCall:
     def test_wraps_return(self):
         text = "foo(a, b);\n  return;"
         assert dh._return_last_call(text) == "return foo(a, b);"
+
+    def test_wraps_function_pointer_return(self):
+        text = "void f(code *fn)\n{\n  (*fn)(1, 2);\n  return;\n}"
+        assert dh._return_last_call(text) == \
+            "void f(code *fn)\n{\n  return (*fn)(1, 2);\n}"
+
+    def test_if_block_not_mangled(self):
+        text = ("void f(int x)\n{\n  if (x) {\n    g(x);\n  }\n"
+                "  h();\n  return;\n}")
+        out = dh._return_last_call(text)
+        assert "return if" not in out
+        assert "return h();" in out
 
 
 class TestMergeSplitArrayReturn:
@@ -139,6 +350,21 @@ class TestGlobalUsage:
     def test_bitop(self):
         u = dh.collect_global_usage("x = option_mask32 & 1;")
         assert u["option_mask32"]["bitop"] >= 1
+
+    def test_intlit_and_ptr_assign(self):
+        u = dh.collect_global_usage("DAT_10 = 1;\nDAT_20 = &DAT_30;")
+        assert u["DAT_10"]["intlit"] == 1
+        assert u["DAT_20"]["ptrassign"] == 1
+
+    def test_dat_ctype_rules(self):
+        usage = dh.collect_global_usage(
+            "DAT_10 = 1;\nDAT_10 = 2;\n*DAT_20 = 1;\n"
+            "x = DAT_30 & 3;\nDAT_40 = &DAT_50;")
+        assert dh._dat_ctype("DAT_10", usage) == "unsigned long"
+        assert dh._dat_ctype("DAT_20", usage) == "undefined8 *"
+        assert dh._dat_ctype("DAT_30", usage) == "unsigned long"
+        assert dh._dat_ctype("DAT_40", usage) == "undefined8 *"
+        assert dh._dat_ctype("DAT_99", usage) is None
 
 
 # --------------------------------------------------------------------------- #

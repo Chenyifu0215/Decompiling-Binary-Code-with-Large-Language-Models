@@ -1,0 +1,16 @@
+{
+  "out_dir": "ignore/generated/github_bins_aarch64",
+  "max_total_mb": 60,
+  "max_file_mb": 32,
+  "include_shared_libs": false,
+  "strip_if_needed": true,
+  "keep_downloads": false,
+  "arches": ["aarch64"],
+  "repos": [
+    {"repo": "sharkdp/fd", "tag": "v10.5.0", "assets": ["fd-v10.5.0-aarch64-unknown-linux-gnu.tar.gz"]},
+    {"repo": "sharkdp/bat", "tag": "v0.26.1", "assets": ["bat-v0.26.1-aarch64-unknown-linux-gnu.tar.gz"]},
+    {"repo": "eza-community/eza", "tag": "v0.23.5", "assets": ["eza_aarch64-unknown-linux-gnu.tar.gz"]},
+    {"repo": "neovim/neovim", "tag": "v0.12.5", "assets": ["nvim-linux-arm64.tar.gz"]},
+    {"repo": "helix-editor/helix", "tag": "25.07.1", "assets": ["helix-25.07.1-aarch64-linux.tar.xz"]}
+  ]
+}

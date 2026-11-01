@@ -1,0 +1,14 @@
+{
+  "out_dir": "ignore/generated/github_bins_i686",
+  "max_total_mb": 30,
+  "max_file_mb": 16,
+  "include_shared_libs": false,
+  "strip_if_needed": true,
+  "keep_downloads": false,
+  "arches": ["i386"],
+  "repos": [
+    {"repo": "sharkdp/fd", "tag": "v10.5.0", "assets": ["fd-v10.5.0-i686-unknown-linux-gnu.tar.gz"]},
+    {"repo": "sharkdp/bat", "tag": "v0.26.1", "assets": ["bat-v0.26.1-i686-unknown-linux-gnu.tar.gz"]},
+    {"repo": "jqlang/jq", "tag": "jq-1.8.2", "assets": ["jq-linux-i386"]}
+  ]
+}

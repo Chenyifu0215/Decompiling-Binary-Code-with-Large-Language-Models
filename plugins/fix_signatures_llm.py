@@ -265,7 +265,7 @@ def redecompile_selected(program, funcs, output_dir, decompiler):
         r = decompiler.decompileFunction(func, 30, None)
         if r is None or not r.decompileCompleted():
             continue
-        c_code = r.getDecompiledFunction().getC()
+        c_code = db.sanitize_qualified_names(r.getDecompiledFunction().getC())
         safe_name = "".join(
             c if c.isalnum() or c in "._-" else "_" for c in func.getName()
         )

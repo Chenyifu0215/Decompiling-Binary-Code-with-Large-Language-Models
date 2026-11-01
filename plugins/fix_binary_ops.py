@@ -22,9 +22,12 @@ LOG = logging.getLogger("fix_binop")
 
 _ERR_RE = re.compile(
     r"^([A-Za-z0-9_./-]+\.c):(\d+):(\d+): error: invalid operands to binary")
-# 行内位运算：标识符 + 运算符（只 cast 简单标识符左操作数）
+# 行内二元运算：标识符 OP 操作数。操作数可为标识符、字面量，或带一层简单
+# cast 的标识符（Ghidra 常见 `DAT_x ^ (uint)DAT_y`）。+/- 也在列：只处理编译
+# 真正报错的行，指针相减/相加正是要 cast 的场景。
+_OPERAND = r"(?:\(\s*[A-Za-z_]\w*\s*\)\s*)?(?:[A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)"
 _OP_RE = re.compile(
-    r"\b([A-Za-z_]\w*)(\s*(?:>>|<<|&|\||\^|\*|/|%)\s*)([A-Za-z_]\w*)")
+    r"\b([A-Za-z_]\w*)(\s*(?:>>|<<|&|\||\^|\*|/|%|\+|-)\s*)(" + _OPERAND + r")")
 
 
 def compile_output(build_dir):
@@ -79,7 +82,13 @@ def main():
             if ln - 1 >= len(rows):
                 continue
             src = rows[ln - 1]
-            new = _OP_RE.sub(r"(unsigned long)\1\2(unsigned long)\3", src)
+            new = src
+            # 反复替换直到稳定：`a + b + c` 这类链式表达式一次只能包住一对
+            for _ in range(5):
+                nxt = _OP_RE.sub(r"(unsigned long)\1\2(unsigned long)\3", new)
+                if nxt == new:
+                    break
+                new = nxt
             if new != src:
                 rows[ln - 1] = new
                 changed_lines += 1

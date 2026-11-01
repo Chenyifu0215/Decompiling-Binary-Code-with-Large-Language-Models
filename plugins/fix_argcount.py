@@ -89,13 +89,42 @@ def collect_arg_votes(build_dir, names):
     return votes
 
 
+def _split_param(p):
+    """拆分参数为 (类型, 数组后缀)。
+
+    ``long *param_1`` -> ('long *', '')；
+    ``undefined1 param_1 [16]`` -> ('undefined1', '[16]')；
+    解析不了返回 None（调用方保留原样，避免把参数名写重）。
+    """
+    p = p.strip()
+    m = re.match(r"^(.*?)\s*\b([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*$", p)
+    if m and m.group(1).strip():
+        return m.group(1).strip(), (m.group(3) or "")
+    return None
+
+
 def _strip_param_name(p):
     """从 'long *param_1' 提取类型 'long *'；无参数名则原样返回。"""
-    p = p.strip()
-    m = re.match(r"^(.*?)\s*\b([A-Za-z_]\w*)\s*$", p)
-    if m and m.group(1).strip():
-        return m.group(1).strip()
-    return p
+    sp = _split_param(p)
+    return sp[0] if sp else p.strip()
+
+
+def _split_params(params_str):
+    """按顶层逗号切分参数（忽略函数指针参数里的括号内逗号）。"""
+    out, depth, cur = [], 0, []
+    for ch in params_str:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        out.append("".join(cur))
+    return [p.strip() for p in out if p.strip()]
 
 
 def rewrite_params(text, name, nargs):
@@ -110,18 +139,24 @@ def rewrite_params(text, name, nargs):
 
     def repl(m):
         prefix, params_str = m.group(1), m.group(2)
-        old_types = [_strip_param_name(p) for p in params_str.split(",") if p.strip()]
-        if old_types == ["void"]:
-            old_types = []
-        if nargs <= len(old_types):
-            types = old_types[:nargs]
+        raw = _split_params(params_str)
+        if raw == ["void"]:
+            raw = []
+        specs = []
+        for p in raw:
+            sp = _split_param(p)
+            specs.append((sp[0], sp[1]) if sp else (None, p))
+        if nargs <= len(specs):
+            specs = specs[:nargs]
         else:
-            types = old_types + ["undefined8"] * (nargs - len(old_types))
-        if types:
-            new_params = ", ".join("%s param_%d" % (t, i + 1)
-                                   for i, t in enumerate(types))
-        else:
-            new_params = "void"
+            specs += [("undefined8", "")] * (nargs - len(specs))
+        parts = []
+        for i, (typ, extra) in enumerate(specs):
+            if typ is None:
+                parts.append(extra)  # 解析不了的参数保持原样（含原名）
+            else:
+                parts.append("%s param_%d%s" % (typ, i + 1, extra))
+        new_params = ", ".join(parts) if parts else "void"
         return prefix + "(" + new_params + ")"
 
     return pat.sub(repl, text)
@@ -132,6 +167,8 @@ def main():
     ap.add_argument("build_dir")
     ap.add_argument("--min-votes", type=int, default=2,
                     help="众数至少出现 N 次才采纳（默认 2）")
+    ap.add_argument("--min-ratio", type=float, default=0.9,
+                    help="众数占比阈值（默认 0.9；不一致的调用点较多时可降低）")
     ap.add_argument("--dry-run", action="store_true",
                     help="只分析/报告，不修改文件")
     args = ap.parse_args()
@@ -155,7 +192,7 @@ def main():
         total = sum(c.values())
         # 众数要占绝对多数（否则可能是变参函数或调用点不一致，改固定参数
         # 会把 too few 变成 too many）
-        if cnt < args.min_votes or cnt / total < 0.9:
+        if cnt < args.min_votes or cnt / total < args.min_ratio:
             continue
         fixed.append((n, argn, cnt, dict(c)))
     LOG.info("可修正参数数的函数: %d", len(fixed))

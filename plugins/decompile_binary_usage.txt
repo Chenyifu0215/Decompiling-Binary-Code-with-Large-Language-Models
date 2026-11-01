@@ -71,14 +71,14 @@ python decompile_binary.py ./targets -o ./out --config decompile_config.json
 
 输入/输出:
   inputs                二进制文件、目录或通配符模式
-  -o, --output-dir      输出目录
+  -o, --output-dir      输出目录（未指定时默认使用 ./decompiled_output）
   -O, --output-file     单输出文件路径
   --single-file         所有函数写入一个文件（需配合 -O）
   --mirror              在输出中镜像输入目录结构
 
 处理:
   --parallel N          并行工作进程数（0=顺序, -1=CPU核心数）
-  --timeout N           单文件超时（秒）, 0=无限制
+  --timeout N           单文件超时（秒）, 0=无限制；超时会终止该文件的处理进程
   --no-analyze          跳过 Ghidra 自动分析
   --lang ID             Ghidra 语言 ID (如 x86:LE:64:default)
   --compiler ID         Ghidra 编译器 ID (如 gcc, windows)

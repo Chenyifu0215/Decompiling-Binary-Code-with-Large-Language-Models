@@ -1,0 +1,43 @@
+{
+  "out_dir": "ignore/generated/corpus",
+  "configs": [
+    {"name": "default"}
+  ],
+  "jobs": [
+    {
+      "name": "jq",
+      "type": "recipe",
+      "git": "https://github.com/jqlang/jq.git",
+      "rev": "jq-1.7.1",
+      "build": [
+        "autoreconf -i",
+        "./configure --disable-maintainer-mode --with-oniguruma=builtin",
+        "make -j"
+      ],
+      "artifacts": ["jq"]
+    },
+    {
+      "name": "curl",
+      "type": "recipe",
+      "git": "https://github.com/curl/curl.git",
+      "rev": "curl-8_9_1",
+      "build": [
+        "autoreconf -i",
+        "./configure --without-ssl --disable-shared",
+        "make -j"
+      ],
+      "artifacts": ["curl"]
+    },
+    {
+      "name": "zlib-example",
+      "type": "recipe",
+      "git": "https://github.com/madler/zlib.git",
+      "rev": "v1.3.1",
+      "build": [
+        "./configure",
+        "make -j"
+      ],
+      "artifacts": ["libz.so*", "example", "minigzip"]
+    }
+  ]
+}
