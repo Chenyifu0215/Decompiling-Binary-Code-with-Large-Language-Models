@@ -24,6 +24,19 @@ import struct
 import sys
 from pathlib import Path
 
+
+def _write_text_if_changed(path, text):
+    """Write only when content differs, preserving mtimes for incremental builds."""
+    path = Path(path)
+    try:
+        if path.read_text(encoding="utf-8") == text:
+            return False
+    except OSError:
+        pass
+    path.write_text(text, encoding="utf-8")
+    return True
+
+
 GHIDRA_TYPES_TEMPLATE = """#ifndef GHIDRA_TYPES_H
 #define GHIDRA_TYPES_H
 
@@ -1000,16 +1013,16 @@ def repair_source_file(src_path, dst_path, value_used=None, global_names=None,
                 return
         except OSError:
             pass
-    dst_path.write_text(result, encoding="utf-8")
+    _write_text_if_changed(dst_path, result)
 
 
 def write_types(out_path):
-    out_path.write_text(GHIDRA_TYPES_TEMPLATE, encoding="utf-8")
+    _write_text_if_changed(out_path, GHIDRA_TYPES_TEMPLATE)
     return out_path
 
 
 def write_compat(out_path):
-    out_path.write_text(COMPAT_TEMPLATE, encoding="utf-8")
+    _write_text_if_changed(out_path, COMPAT_TEMPLATE)
     return out_path
 
 
@@ -1046,7 +1059,7 @@ def write_prototypes(decomp_dir, out_path, files=None, dup_names=None, binary=No
         lines.append(psig)
     lines.append("")
     lines.append("#endif")
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_text_if_changed(out_path, "\n".join(lines) + "\n")
     return out_path
 
 
@@ -1821,7 +1834,7 @@ def write_data_defs(binary, decomp_dir, out_path, files=None):
             lines.append("char %s[0x%x];" % (name, size))
         lines.append("")
 
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_text_if_changed(out_path, "\n".join(lines) + "\n")
     return out_path
 
 
@@ -1858,7 +1871,7 @@ def write_globals(binary, decomp_dir, out_path, files=None):
     for name, size, _ in extra_globals(binary, decomp_dir, files):
         lines.append("extern char %s[0x%x];" % (name, size or 16))
     lines.append("#endif")
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_text_if_changed(out_path, "\n".join(lines) + "\n")
     return out_path
 
 
@@ -1872,19 +1885,20 @@ def write_makefile(out_dir, c_files, exe_name):
         "%s: $(OBJS)" % exe_name,
         "\t$(CC) -o $@ $(OBJS)",
         "",
-        "%.o: %.c",
+        "%.o: %.c ghidra_types.h compat.h globals.h",
         "\t$(CC) $(CFLAGS) -c $< -o $@",
         "",
         ".PHONY: clean",
         "clean:",
         "\trm -f $(OBJS) %s" % exe_name,
     ]
-    (out_dir / "Makefile").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_text_if_changed(out_dir / "Makefile", "\n".join(lines) + "\n")
 
 
 def write_build_ps1(out_dir, c_files, exe_name):
     lines = [
         "$ErrorActionPreference = 'Stop'",
+        "Set-Location -LiteralPath $PSScriptRoot",
         "$vcvars = @(",
         "  'C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Auxiliary/Build/vcvars64.bat',",
         "  'C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Auxiliary/Build/vcvars64.bat',",
@@ -1897,17 +1911,35 @@ def write_build_ps1(out_dir, c_files, exe_name):
         "",
         "New-Item -ItemType Directory -Force -Path obj | Out-Null",
         "$objs = @()",
+        "$changed = $false",
+        "$files = @(",
+        "  " + ", ".join('"%s"' % f for f in c_files),
+        ")",
+        "foreach ($f in $files) {",
+        "  $stem = [IO.Path]::GetFileNameWithoutExtension($f)",
+        '  $obj = "obj\\$stem.obj"',
+        "  $rebuild = -not (Test-Path $obj)",
+        "  if (-not $rebuild) {",
+        "    $objTime = (Get-Item $obj).LastWriteTime",
+        "    if ($objTime -lt (Get-Item $f).LastWriteTime) { $rebuild = $true }",
+        '    foreach ($dep in @("ghidra_types.h","compat.h","globals.h")) {',
+        "      if ($objTime -lt (Get-Item $dep).LastWriteTime) { $rebuild = $true }",
+        "    }",
+        "  }",
+        "  if ($rebuild) {",
+        '    & cl /nologo /utf-8 /w /c /I. /FI ghidra_types.h /FI compat.h /FI function_prototypes.h /FI globals.h "$f" /Fo"$obj"',
+        "    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+        "    $changed = $true",
+        "  }",
+        "  $objs += $obj",
+        "}",
+        "if ($changed -or -not (Test-Path \"%s\")) {" % exe_name,
+        "  & link /nologo /out:%s $objs" % exe_name,
+        "  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+        '  Write-Host "Built %s"' % exe_name,
+        "}",
     ]
-    for f in c_files:
-        lines.append('& cl /nologo /utf-8 /w /c /I. /FI ghidra_types.h /FI compat.h /FI function_prototypes.h /FI globals.h "%s" /Fo"obj\\%s.obj"' % (f, Path(f).stem))
-        lines.append('if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }')
-        lines.append('$objs += "obj\\%s.obj"' % Path(f).stem)
-    lines += [
-        "& link /nologo /out:%s $objs" % exe_name,
-        "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
-        'Write-Host "Built %s"' % exe_name,
-    ]
-    (out_dir / "build.ps1").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_text_if_changed(out_dir / "build.ps1", "\n".join(lines) + "\n")
 
 
 def parse_map_whitelist(map_path):
