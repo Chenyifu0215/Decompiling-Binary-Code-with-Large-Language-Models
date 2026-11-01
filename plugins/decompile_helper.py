@@ -45,8 +45,6 @@ GHIDRA_TYPES_TEMPLATE = """#ifndef GHIDRA_TYPES_H
 #include <string.h>
 #include <time.h>
 #include <locale.h>
-#include <pwd.h>
-#include <grp.h>
 #ifdef _MSC_VER
 /* PE 目标（Windows）：用 Windows 头；STRICT 让 SDK 定义 HINSTANCE__ 等
    struct tag，再补 tag→类型别名（Ghidra 把 HINSTANCE__ 当类型名用）。 */
@@ -93,6 +91,8 @@ typedef struct HCOLORSPACE__ HCOLORSPACE__;
 typedef struct HENHMETAFILE__ HENHMETAFILE__;
 typedef struct HMETAFILE__ HMETAFILE__;
 #else
+#include <pwd.h>
+#include <grp.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
