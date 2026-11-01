@@ -710,122 +710,218 @@ def decompile_function(program, func, decompiler) -> Optional[str]:
     return result.getDecompiledFunction().getC()
 
 
+def _resolve_decompiler_workers(workers: int) -> int:
+    if workers is None:
+        return 1
+    if workers > 1:
+        return workers
+    if workers == 0:
+        return max(1, min(4, os.cpu_count() or 1))
+    return 1
+
+
+def _make_function_jobs(functions):
+    name_counts = {}
+    for f in functions:
+        name_counts[f.getName()] = name_counts.get(f.getName(), 0) + 1
+
+    jobs = []
+    for func in functions:
+        name = func.getName()
+        addr = func.getEntryPoint()
+        safe_name = "".join(
+            c if c.isalnum() or c in "._-" else "_" for c in name
+        )
+        if name_counts.get(name, 0) > 1:
+            safe_name = "%s_%s" % (safe_name, str(addr))
+        jobs.append((func, name, addr, str(func.getSignature()), safe_name))
+    return jobs
+
+
+def _emit_decompiled_function(
+    per_func_dir, out_handle, name, addr, signature, safe_name, c_code
+):
+    if per_func_dir is not None:
+        func_file = per_func_dir / f"{safe_name}.c"
+        func_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(func_file, "w", encoding="utf-8") as f:
+            f.write(f"// Function: {name}\n")
+            f.write(f"// Address:  {addr}\n")
+            f.write(f"// Type:     {signature}\n")
+            f.write("// " + "=" * 60 + "\n")
+            f.write(c_code)
+
+    if out_handle:
+        out_handle.write(f"// ===== {name} @ {addr} =====\n")
+        out_handle.write(f"// {signature}\n\n")
+        out_handle.write(c_code)
+        out_handle.write("\n\n")
+
+
+def _decompile_functions_parallel(
+    program, jobs, per_func_dir, out_handle, workers
+) -> Tuple[int, int]:
+    from ghidra.app.decompiler import DecompInterface, DecompileOptions
+
+    tls = threading.local()
+    created = []
+    created_lock = threading.Lock()
+
+    def init_worker():
+        d = DecompInterface()
+        d.setOptions(DecompileOptions())
+        d.toggleSyntaxTree(False)
+        if not d.openProgram(program):
+            raise RuntimeError(
+                "Failed to open program in decompiler: %s" % d.getLastMessage()
+            )
+        tls.decompiler = d
+        with created_lock:
+            created.append(d)
+
+    def work(job):
+        func, name, addr, signature, safe_name = job
+        c_code = decompile_function(program, func, tls.decompiler)
+        if c_code is not None:
+            c_code = sanitize_qualified_names(c_code)
+        return job, c_code
+
+    count = 0
+    total_bytes = 0
+    try:
+        logging.info("Using %d parallel decompiler workers.", workers)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, initializer=init_worker
+        ) as executor:
+            futures = [executor.submit(work, job) for job in jobs]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    job, c_code = future.result()
+                except Exception as e:
+                    logging.warning("Parallel decompilation failed: %s", e)
+                    continue
+
+                func, name, addr, signature, safe_name = job
+                if c_code is None:
+                    logging.warning("Failed to decompile: %s @ %s", name, addr)
+                    continue
+
+                count += 1
+                total_bytes += len(c_code)
+                _emit_decompiled_function(
+                    per_func_dir, out_handle, name, addr, signature,
+                    safe_name, c_code
+                )
+                if count % 100 == 0:
+                    logging.info("  Decompiled %d/%d functions...", count, len(jobs))
+    finally:
+        for d in created:
+            try:
+                d.closeProgram()
+                d.dispose()
+            except Exception:
+                pass
+    return count, total_bytes
+
+
 def decompile_all_functions(
     program,
     output_dir: Optional[str] = None,
     output_file: Optional[str] = None,
     single_file: bool = False,
     function_list: Optional[list] = None,
+    workers: int = 1,
 ) -> Tuple[int, int]:
     from ghidra.app.decompiler import DecompInterface, DecompileOptions
 
-    decompiler = DecompInterface()
-    options = DecompileOptions()
-    decompiler.setOptions(options)
-    decompiler.toggleSyntaxTree(False)
+    func_mgr = program.getFunctionManager()
+    functions = list(func_mgr.getFunctions(True))
+    total = len(functions)
+    logging.info("Found %d functions in %s", total, program.getName())
 
-    if not decompiler.openProgram(program):
-        err = decompiler.getLastMessage()
-        raise RuntimeError(f"Failed to open program in decompiler: {err}")
+    if function_list:
+        filtered = []
+        for spec in function_list:
+            func = None
+            try:
+                addr = program.getAddressFactory().getAddress(spec)
+                func = func_mgr.getFunctionAt(addr)
+            except Exception:
+                pass
+            if func is None:
+                fiter = func_mgr.getFunctions(True)
+                while True:
+                    try:
+                        f = fiter.next()
+                    except StopIteration:
+                        break
+                    if f.getName() == spec:
+                        func = f
+                        break
+            if func:
+                filtered.append(func)
+            else:
+                logging.warning("Function not found: %s", spec)
+        functions = filtered
+
+    out_handle = None
+    if output_file and single_file:
+        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+        out_handle = open(output_file, "w", encoding="utf-8")
+
+    per_func_dir = None
+    if not single_file:
+        if output_dir:
+            per_func_dir = Path(output_dir)
+        elif output_file:
+            of = Path(output_file)
+            per_func_dir = of if of.is_dir() else of.parent
+
+    jobs = _make_function_jobs(functions)
+    workers = _resolve_decompiler_workers(workers)
 
     try:
-        func_mgr = program.getFunctionManager()
-        functions = list(func_mgr.getFunctions(True))
-        total = len(functions)
-        logging.info("Found %d functions in %s", total, program.getName())
-
-        if function_list:
-            filtered = []
-            for spec in function_list:
-                func = None
-                try:
-                    addr = program.getAddressFactory().getAddress(spec)
-                    func = func_mgr.getFunctionAt(addr)
-                except Exception:
-                    pass
-                if func is None:
-                    fiter = func_mgr.getFunctions(True)
-                    while True:
-                        try:
-                            f = fiter.next()
-                        except StopIteration:
-                            break
-                        if f.getName() == spec:
-                            func = f
-                            break
-                if func:
-                    filtered.append(func)
-                else:
-                    logging.warning("Function not found: %s", spec)
-            functions = filtered
-
-        out_handle = None
-        if output_file and single_file:
-            Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-            out_handle = open(output_file, "w", encoding="utf-8")
-
-        per_func_dir = None
-        if not single_file:
-            if output_dir:
-                per_func_dir = Path(output_dir)
-            elif output_file:
-                of = Path(output_file)
-                per_func_dir = of if of.is_dir() else of.parent
-
-        count = 0
-        total_bytes = 0
-        # 统计同名函数（不同模块的 static 同名函数），输出时加地址后缀避免覆盖
-        name_counts = {}
-        for f in functions:
-            name_counts[f.getName()] = name_counts.get(f.getName(), 0) + 1
-
-        for func in functions:
-            addr = func.getEntryPoint()
-            name = func.getName()
-            c_code = decompile_function(program, func, decompiler)
-            if c_code is not None:
-                c_code = sanitize_qualified_names(c_code)
-
-            if c_code is None:
-                logging.warning("Failed to decompile: %s @ %s", name, addr)
-                continue
-
-            count += 1
-            total_bytes += len(c_code)
-            logging.debug("[%4d/%d] %s @ %s", count, total, name, addr)
-
-            if per_func_dir is not None:
-                safe_name = "".join(
-                    c if c.isalnum() or c in "._-" else "_" for c in name
+        if workers > 1 and not single_file:
+            count, total_bytes = _decompile_functions_parallel(
+                program, jobs, per_func_dir, out_handle, workers
+            )
+        else:
+            decompiler = DecompInterface()
+            decompiler.setOptions(DecompileOptions())
+            decompiler.toggleSyntaxTree(False)
+            if not decompiler.openProgram(program):
+                raise RuntimeError(
+                    "Failed to open program in decompiler: %s"
+                    % decompiler.getLastMessage()
                 )
-                if name_counts.get(name, 0) > 1:
-                    safe_name = "%s_%s" % (safe_name, str(addr))
-                func_file = per_func_dir / f"{safe_name}.c"
-                func_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(func_file, "w", encoding="utf-8") as f:
-                    f.write(f"// Function: {name}\n")
-                    f.write(f"// Address:  {addr}\n")
-                    f.write(f"// Type:     {func.getSignature()}\n")
-                    f.write("// " + "=" * 60 + "\n")
-                    f.write(c_code)
-
-            if out_handle:
-                out_handle.write(f"// ===== {name} @ {addr} =====\n")
-                out_handle.write(f"// {func.getSignature()}\n\n")
-                out_handle.write(c_code)
-                out_handle.write("\n\n")
-
-        if out_handle:
-            out_handle.close()
+            try:
+                count = 0
+                total_bytes = 0
+                for func, name, addr, signature, safe_name in jobs:
+                    c_code = decompile_function(program, func, decompiler)
+                    if c_code is not None:
+                        c_code = sanitize_qualified_names(c_code)
+                    if c_code is None:
+                        logging.warning("Failed to decompile: %s @ %s", name, addr)
+                        continue
+                    count += 1
+                    total_bytes += len(c_code)
+                    logging.debug("[%4d/%d] %s @ %s", count, total, name, addr)
+                    _emit_decompiled_function(
+                        per_func_dir, out_handle, name, addr, signature,
+                        safe_name, c_code
+                    )
+            finally:
+                decompiler.closeProgram()
+                decompiler.dispose()
 
         logging.info(
             "Successfully decompiled %d/%d functions.", count, len(functions)
         )
         return count, total_bytes
-
     finally:
-        decompiler.closeProgram()
-        decompiler.dispose()
+        if out_handle:
+            out_handle.close()
 
 
 def export_program_metadata(program, output_file: str):
@@ -961,6 +1057,7 @@ def decompile_single_file(
             output_file=output_file_str,
             single_file=args.single_file,
             function_list=args.functions,
+            workers=args.decompiler_workers,
         )
         stats.add_success(num_funcs, num_bytes)
 
@@ -1081,6 +1178,7 @@ def _worker_decompile(
                 output_file=output_file_str,
                 single_file=a.single_file,
                 function_list=a.functions,
+                workers=a.decompiler_workers,
             )
             return (filename, True, None, num_funcs, num_bytes)
 
@@ -1120,10 +1218,13 @@ def _run_worker_once(
             "list_functions",
             "meta",
             "functions",
+            "decompiler_workers",
             "verbose",
             "max_memory",
         )
     }
+    if args_dict.get("decompiler_workers") == 0 and args.parallel not in (0, None):
+        args_dict["decompiler_workers"] = 1
 
     process = ctx.Process(
         target=_worker_entry,
@@ -1343,6 +1444,7 @@ def apply_config(args: argparse.Namespace, config: dict) -> argparse.Namespace:
         "compiler": "compiler",
         "ghidra_dir": "ghidra_dir",
         "parallel": "parallel",
+        "decompiler_workers": "decompiler_workers",
         "timeout": "timeout",
         "max_memory": "max_memory",
         "resume": "resume",
@@ -1426,7 +1528,13 @@ Examples:
         "--parallel",
         type=int,
         default=0,
-        help="Number of parallel workers (0 = sequential, -1 = CPU count)",
+        help="Number of parallel file workers (0 = sequential, -1 = CPU count)",
+    )
+    proc_group.add_argument(
+        "--decompiler-workers",
+        type=int,
+        default=0,
+        help="Parallel decompiler workers per binary (0 = auto, 1 = sequential)",
     )
     proc_group.add_argument(
         "--timeout",
