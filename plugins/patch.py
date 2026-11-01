@@ -20,10 +20,25 @@ import re
 from pathlib import Path
 
 
+def _resolve_patch_path(build_root, fname):
+    if not isinstance(fname, str) or not fname:
+        return None, "invalid patch file path: %r" % fname
+    relative = Path(fname)
+    if relative.is_absolute():
+        return None, "%s: absolute patch paths are not allowed" % fname
+    try:
+        path = (build_root / relative).resolve()
+        path.relative_to(build_root)
+    except (OSError, RuntimeError, ValueError):
+        return None, "%s: patch path escapes build directory" % fname
+    return path, None
+
+
 def apply_patch_list(build_dir, patches):
     """Apply `patches` to files under `build_dir`. Returns (applied, errors)."""
     applied = 0
     errors = []
+    build_root = Path(build_dir).resolve()
     for patch in patches:
         op = patch.get("op")
         fname = patch.get("file")
@@ -31,7 +46,10 @@ def apply_patch_list(build_dir, patches):
             errors.append("invalid patch (missing op/file): %s" % patch)
             continue
 
-        path = Path(build_dir) / fname
+        path, path_error = _resolve_patch_path(build_root, fname)
+        if path_error:
+            errors.append(path_error)
+            continue
         if not path.is_file():
             errors.append("%s: file not found" % fname)
             continue

@@ -1,193 +1,136 @@
 新增功能使用说明
 ================
-更新时间：2026-09-15
 
-本文档总结除 decompile_binary.py / decompile_helper.py（已有各自 usage）之外的
-新增脚本与能力。覆盖：规则修复工具、LLM 签名/类型修复、验证回退、GUI、测试。
+本文档总结除 decompile_binary.py / decompile_helper.py（已有各自 usage）之外，
+新增脚本与能力的使用方法。覆盖：静态修复闭环、LLM 签名修复、LLM 类型修复、
+GUI、单元测试。
 
 =====================================================================
 一、总览：新增脚本清单
 =====================================================================
 
-【规则修复工具】（错误驱动，无 LLM，可重复跑）
-  fix_conflicts.py     移除与系统头冲突的同名函数（如 bash 自己的 getenv）
-  fix_undeclared.py    补未声明符号（函数指针/数据常量/类型）
-  fix_argcount.py      调用点投票推断参数个数
-  fix_binary_ops.py    指针参与位运算/算术运算 → cast 成整数
-
-【LLM 修复】（需 LLM_API_KEY）
-  fix_signatures_llm.py LLM 签名修复（+ --verify 验证回退）
-  fix_types_llm.py      LLM 类型修复（+ --verify 验证回退）
-  fix_signatures.py     签名修复基础版（手工 sigs.json）
-
-【基础模块】
-  llm.py                LLM proposer（DeepSeek + fallback 规则库）
-  patch.py              补丁引擎（replace/regex）
-  orchestrator.py       静态编译修复闭环
-  decompile_gui.py      桌面 GUI
-
-【测试】
-  test_core.py(59) + test_golden.py + test_e2e.py = 61 用例
+  orchestrator.py      静态编译修复闭环（编译→失败→补丁→重试，收敛判据=编译成功）
+  fix_signatures_llm.py LLM 签名修复（证据包→LLM 推断签名→回灌 Ghidra）
+  fix_types_llm.py      LLM 类型/结构体错误修复（生成补丁修 .c 文件）
+  fix_signatures.py     签名修复基础版（按 sigs.json 手工指定签名回灌）
+  llm.py                LLM proposer 模块（fallback 规则库 + DeepSeek 调用）
+  patch.py              补丁引擎模块（replace/regex，可重放）
+  decompile_gui.py      桌面 GUI（拖拽反编译 + 签名修复 + 生成工程 + 静态修复）
+  test_core.py          单元测试（pytest，测纯函数）
+  启动反编译器.bat       双击启动 GUI
 
 =====================================================================
-二、环境变量
+二、环境变量（LLM 相关）
 =====================================================================
-  LLM_API_KEY          （必需，LLM 修复时）DeepSeek/OpenAI 兼容 key
-  LLM_BASE_URL         （可选）默认 https://api.deepseek.com/v1
-  LLM_MODEL            （可选）默认 deepseek-chat（快且准）
-  GHIDRA_INSTALL_DIR   （可选）默认 C:/ghidra/ghidra12.1
-  GHIDRA_SIG_PROJECTS  （可选）如 busybox：启用项目特有内部库签名表（默认关闭）
+
+  LLM_API_KEY    （必需）DeepSeek / OpenAI 兼容 API 的 key
+  LLM_BASE_URL   （可选）默认 https://api.deepseek.com/v1
+  LLM_MODEL      （可选）默认 deepseek-chat（快）；慢模型可用 deepseek-v4-pro
+
+  仅用 --proposer fallback 时不需 key。
 
 =====================================================================
 三、各脚本用法
 =====================================================================
 
-■ fix_conflicts.py —— 移除与系统头冲突的同名函数
-    python fix_conflicts.py <build_dir> [--dry-run]
+■ orchestrator.py —— 静态编译修复闭环
+    python orchestrator.py <binary> <decomp_dir> [options]
 
-  场景：动态二进制里可能有「自己实现、但与 libc 同名」的函数（如 bash 的
-  getenv/setenv/unsetenv），其 prototype/定义会和系统头 conflicting——每个
-  include prototype.h 的文件都报错，一个函数能放大成几千条（实测 bash 4 个函数
-  → 6272 条）。
-  流程：编译收集 `conflicting types for 'X'` → 从 function_prototypes.h 移除声明
-  → 从 Makefile 的 SRCS 移除对应 .c（目录里重命名 .c.bak）。
-  实测：bash 10544 → 4269，成功 0 → 575。
+  关键参数：
+    -o/--build-dir      输出 build 目录（默认 static_build）
+    --proposer          fallback（默认，规则库）| llm（需 key）
+    --map               GNU ld map 文件（过滤静态链接 libc，强烈建议）
+    --max-iter          最大迭代轮数（默认 10）
+    --no-prepare        跳过 decompile_helper，直接用现有 build 目录
+    --make-cmd          覆盖 make 命令（需自带 -C <dir>）
 
-■ fix_undeclared.py —— 补未声明符号
-    python fix_undeclared.py <binary> <build_dir> [--log LOG]
+  示例：
+    python orchestrator.py test_complex.o test_out_fixed -o static_build
+    python orchestrator.py busybox decomp_dir -o build --map busybox.map --proposer llm
 
-  只处理「编译 log 里真正报 undeclared」的名字（避免全量符号表反查爆炸）：
-    - 名字在符号表里是 FUNC   → 追加 extern undefined8 name(); 到 prototypes.h
-    - 名字在符号表里是 OBJECT → 追加数据定义到 data_defs.c
-    - 都查不到                → 追加 extern undefined8 name; 兜底
-  可重复执行直到 undeclared 收敛。实测：busybox 1066 → 949（-117）。
-
-■ fix_argcount.py —— 调用点投票推断参数个数
-    python fix_argcount.py <build_dir> [--min-votes N] [--dry-run]
-
-  原理：too few/many 说明「声明参数数」与「调用点实际参数数」不一致。统计每个被调
-  函数在所有调用点的参数数分布，众数占比 ≥90%（自动排除变参函数）才采纳，然后
-  同时修 function_prototypes.h 和 .c 里的函数定义。
-  关键：**保留已有参数的类型，只调整个数**（新增参数才补 undefined8）——否则会把
-  指针参数改成整数，引发 subscripted/unary 错误（实测旧版曾 +205 变差）。
-  实测：busybox 949 → 875；改进保留类型后 875 → 852（无副作用）。
-
-■ fix_binary_ops.py —— 指针参与运算 cast
-    python fix_binary_ops.py <build_dir> [--dry-run]
-
-  场景：Ghidra 把 SIMD 向量/整数反编译成指针，导致 invalid operands
-  （ptr >> n、ptr * ptr、ptr / ptr、128 位乘除 SUB168(...) 等）。
-  对编译真正报错的行，把 `ident OP ident` 的两个操作数都 cast 成 (unsigned long)。
-  实测：stripped busybox 39028 → 10893；cat 17 → 9。
-
-■ fix_signatures_llm.py —— LLM 签名修复（核心）
+■ fix_signatures_llm.py —— LLM 签名修复（核心，修 too few/many arguments）
     python fix_signatures_llm.py <binary> [options]
 
   关键参数：
-    --prescreen         编译预筛：只修 too few/many 报错的函数（省成本）
-    --build-dir         --prescreen 的 build 目录
-    --verify            修复后重新生成工程+编译，错误总数增加则整体回退
-                        （验证时自动重跑规则工具链 fix_conflicts/undeclared/
-                         argcount/binary_ops，保证 baseline 与 after 同口径）
-    --no-sort           不按被调次数排序（默认高频被调函数优先修）
-    --model/--slow-model  快模型（默认 deepseek-chat）/ 慢模型兜底重试
-    --functions NAME... 只处理指定函数
-    --max-functions N   最多处理 N 个
+    -o/--output-dir     重新反编译输出目录（覆盖原 decomp 目录）
+    --functions NAME...  只处理指定函数名
+    --prescreen          编译预筛：先 make -k 收集 too few/many 报错函数，只修它们
+    --build-dir          --prescreen 时的 build 目录
+    --max-functions N    最多处理 N 个函数
+    --model              快模型（默认 deepseek-chat）
+    --slow-model         慢模型兜底（如 deepseek-v4-pro），对快模型失败的函数重试
 
-  机制：证据包=伪代码+汇编+调用点+callee 锚点（类型传播）；修好的函数回流成
-  新锚点（多层传播）；变参函数靠「调用点参数数不一致」识别跳过。
-  实测：bash 1899 → 1267（--verify 一轮，-632）。
+  推荐流程：
+    python decompile_binary.py busybox -o out                     # ① 反编译
+    python decompile_helper.py all busybox out/busybox_decomp \
+        -o build --map busybox.map                               # ② 生成工程
+    python fix_signatures_llm.py busybox --prescreen \
+        --build-dir build -o out/busybox_decomp                  # ③ 预筛+修签名
 
-■ fix_types_llm.py —— LLM 类型修复
-    python fix_types_llm.py <binary> <decomp_dir> --build-dir <build_dir> [--verify]
+■ fix_types_llm.py —— LLM 类型/结构体错误修复（修 array type / long 当指针等）
+    python fix_types_llm.py <binary> <decomp_dir> --build-dir <build_dir> [options]
 
-  覆盖错误：array type / 指针当整数 / 位运算类型 / invalid use of void /
-  called object（变量被当函数调用）/ subscripted value（标量被下标）。
-  伪代码必须用 build 目录「已处理」的 .c（否则 LLM 补丁 old 文本匹配不上）；
-  --verify 修复后编译，错误增加则回退。
-  实测（bash 迭代）：1267→1099→1020→952→898（第 5 轮 +45 被回退），收益<30 停。
+  关键参数：
+    --build-dir          （必需）build 目录
+    --max-functions N    最多处理 N 个函数
+    --model / --slow-model  同 fix_signatures_llm
 
-■ fix_signatures.py —— 手工签名修复
+  示例：
+    python fix_types_llm.py busybox out/busybox_decomp --build-dir build --max-functions 50
+
+■ fix_signatures.py —— 签名修复基础版（手工 sigs.json）
     python fix_signatures.py <binary> --signatures sigs.json [-o out_dir] [--dump NAME]
+
   sigs.json 格式：
     [{"name": "apply_op", "signature": "int apply_op(int op, int a, int b)"}]
 
-■ orchestrator.py —— 静态修复闭环
-    python orchestrator.py <binary> <decomp_dir> [-o build_dir]
-        [--proposer fallback|llm] [--map map] [--max-iter 10] [--no-prepare]
-
-■ decompile_gui.py —— 桌面 GUI
-    双击 启动反编译器.bat（或 python decompile_gui.py）
-    功能：拖入二进制 → 反编译 → [签名修复] → [生成工程] → [静态修复]
-
 =====================================================================
-四、完整流程（推荐顺序，实测 bash 899 错误 / 1335 成功）
+四、完整端到端流程（推荐顺序）
 =====================================================================
 
   # 1. 反编译（含 libc 类型/签名自动导入）
   python decompile_binary.py <binary> -o <work>
 
-  # 2. 生成可编译工程
-  python decompile_helper.py all <binary> <work>/<stem>_decomp -o <build>
+  # 2. 生成可编译工程（含 libc 过滤）
+  python decompile_helper.py all <binary> <work>/<stem>_decomp \
+      -o <work>/<stem>_build --map <binary>.map
 
-  # 3. 移除与系统头冲突的同名函数
-  python fix_conflicts.py <build>
+  # 3. LLM 签名修复（预筛只修报错的，省成本）
+  python fix_signatures_llm.py <binary> --prescreen \
+      --build-dir <work>/<stem>_build -o <work>/<stem>_decomp
 
-  # 4. 规则工具链
-  python fix_undeclared.py <binary> <build>
-  python fix_argcount.py <build>
-  python fix_binary_ops.py <build>
-
-  # 5. LLM 签名修复（带验证回退）—— 改 decomp，之后需重新生成
-  python fix_signatures_llm.py <binary> --prescreen --verify \
-      --build-dir <build> -o <work>/<stem>_decomp
-
-  # 6. 重新生成 + 冲突 + 工具链（顺序必须）
-  python decompile_helper.py all <binary> <work>/<stem>_decomp -o <build>
-  python fix_conflicts.py <build>
-  python fix_undeclared.py <binary> <build>
-  python fix_argcount.py <build>
-  python fix_binary_ops.py <build>
-
-  # 7. LLM 类型修复迭代（每轮 --verify，某轮回退或收益<30 则停）
+  # 4. （可选）LLM 类型错误修复
   python fix_types_llm.py <binary> <work>/<stem>_decomp \
-      --build-dir <build> --verify
-  #   重复执行上一条
+      --build-dir <work>/<stem>_build
 
-  # 8. 编译统计
-  wsl make -k -C <build> -j
-
-=====================================================================
-五、验证回退机制（--verify）—— 迭代必需
-=====================================================================
-  原理：修复后重新生成并编译，若错误总数增加则整体回退（恢复被改文件的备份）。
-
-  为什么必需：LLM 迭代**不是单调的**。实测变差案例：
-    - busybox 第二轮签名修复：-452 变差
-    - bash 第二轮签名修复：+366 变差
-    - bash 类型修复第 5 轮：+45 变差
-  没有 --verify 时「迭代 = 赌博」；有了它迭代单调收敛（bash 实测
-  1267→1099→1020→952→898，最后一轮被拦截回退）。
-
-  使用：
-    fix_signatures_llm.py --verify   （改 decomp；验证时自动重跑规则工具链）
-    fix_types_llm.py      --verify   （改 build；直接编译对比）
+  # 5. 重新生成工程并编译
+  python decompile_helper.py all <binary> <work>/<stem>_decomp \
+      -o <work>/<stem>_build --map <binary>.map
+  # （或直接 orchestrator 闭环）
+  python orchestrator.py <binary> <work>/<stem>_decomp \
+      -o <work>/<stem>_build --map <binary>.map --proposer llm
 
 =====================================================================
-六、测试
+五、GUI（desktop）
 =====================================================================
-  python -m pytest test_core.py test_golden.py test_e2e.py -q    # 61 passed
+
+  双击 启动反编译器.bat（或 python decompile_gui.py）
+
+  功能：拖入二进制/目录 → 反编译 → [签名修复]（可设上限）→ [生成工程] → [静态修复]
+  四界块可拉伸/隐藏；暗/亮主题；文件树过滤 .o；目录扫描排除 .o/.obj。
+  LLM 相关操作需设置 LLM_API_KEY 环境变量。
 
 =====================================================================
-七、注意事项 / 常见坑
+六、单元测试
 =====================================================================
-  - LLM 功能依赖 LLM_API_KEY；规则工具链离线可用。
-  - 静态链接二进制用 --map（decompile_helper）过滤内联 libc；
-    动态链接由 .dynsym 的 UND 导入符号自动过滤（无需 map）。
+
+  python -m pytest test_core.py -v      # 31 个纯函数用例（无需 Ghidra，快）
+
+=====================================================================
+七、注意事项
+=====================================================================
+
+  - LLM 功能全部依赖 LLM_API_KEY 环境变量；fallback 规则库离线可用。
+  - 静态链接二进制务必配 --map 过滤 libc，否则符号冲突。
   - 大文件先设 --max-functions 小值试跑，确认效果再全量。
-  - **流程顺序**：decompile_helper 重新生成会覆盖 build 的规则/LLM 补丁。
-    fix_signatures_llm --verify 会重新生成工程 → 必须在 fix_types 之前；
-    每次重新生成后要重跑 fix_conflicts + 规则工具链。
-  - fix_conflicts 依赖「先编译一次收集 conflicting」，所以放工具链最前。
-  - stripped 二进制的函数名都是 FUN_xxx，签名修复才有意义（_skip_name 已不过滤）。
-  - Git：只提交本地仓库（static_decompile/），未经明确指示不 push 远端。
+  - 类型修复（fix_types）对「简单结构体」有效，对「深度类型推断」仍有边界。

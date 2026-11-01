@@ -251,11 +251,9 @@ class LLMProposer:
             return None
         ret = str(data.get("return_type", "")).strip()
         params = data.get("params")
-        if not ret or not isinstance(params, list) or not params:
+        if not ret or not isinstance(params, list):
             return None
         params = [str(p).strip() for p in params if str(p).strip()]
-        if not params:
-            return None
         return ret, params
 
     def infer_type_fixes(self, func_name, c_code, asm, xrefs, errors):

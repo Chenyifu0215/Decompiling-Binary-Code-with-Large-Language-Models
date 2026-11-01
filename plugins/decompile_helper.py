@@ -172,6 +172,13 @@ typedef long long          int7;
 
 typedef undefined8 code();
 
+/* Copy the low bytes of a scalar into a Ghidra-decompiled byte array.
+   A function keeps the generated code compatible with both GCC and MSVC. */
+static inline void ghidra_copy_scalar(void *dst, undefined8 value, size_t size)
+{
+    memcpy(dst, &value, size);
+}
+
 /* Ghidra 会直接引用 C 库类型名（如 pthread_key_create 的析构函数类型） */
 typedef void __destr_function(void *);
 
@@ -410,8 +417,110 @@ def should_skip(path):
     return is_stub(path)
 
 
+def _quoted_literal_end(text, start):
+    """Return the first position after a C string or character literal."""
+    quote = text[start]
+    i = start + 1
+    while i < len(text):
+        if text[i] == "\\":
+            i = min(i + 2, len(text))
+        elif text[i] == quote:
+            return i + 1
+        else:
+            i += 1
+    return len(text)
+
+
 def _strip_block_comments(text):
-    return re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    """Remove C block comments without treating delimiters in literals as comments."""
+    parts = []
+    i = 0
+    while i < len(text):
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = len(text) if end == -1 else end
+            parts.append(text[i:end])
+            i = end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            if end == -1:
+                parts.append(text[i:])
+                break
+            i = end + 2
+        elif text[i] in ('"', "'"):
+            end = _quoted_literal_end(text, i)
+            parts.append(text[i:end])
+            i = end
+        else:
+            parts.append(text[i])
+            i += 1
+    return "".join(parts)
+
+
+def _protect_c_literals_and_comments(text):
+    """Replace literals and line comments with inert tokens during regex repairs."""
+    protected = []
+    parts = []
+    i = 0
+    while i < len(text):
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = len(text) if end == -1 else end
+        elif text[i] in ('"', "'"):
+            end = _quoted_literal_end(text, i)
+        else:
+            parts.append(text[i])
+            i += 1
+            continue
+        value = text[i:end]
+        token = "\x01%d%s\x02" % (len(protected), "\n" * value.count("\n"))
+        protected.append((token, value))
+        parts.append(token)
+        i = end
+    return "".join(parts), protected
+
+
+def _transform_c_code(text, transform):
+    protected_text, protected = _protect_c_literals_and_comments(text)
+    result = transform(protected_text)
+    for token, value in protected:
+        result = result.replace(token, value)
+    return result
+
+
+def _merge_multiline_signature(text):
+    """Join the first function signature through its balanced closing paren."""
+    offset = 0
+    start = None
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped and not stripped.startswith(("//", "#")):
+            start = offset + len(line) - len(line.lstrip())
+            break
+        offset += len(line)
+    if start is None:
+        return text
+    opening = text.find("(", start)
+    boundary = min(
+        (pos for pos in (text.find("{", start), text.find(";", start)) if pos != -1),
+        default=len(text),
+    )
+    if opening == -1 or opening > boundary:
+        return text
+    depth = 0
+    closing = None
+    for pos in range(opening, len(text)):
+        if text[pos] == "(":
+            depth += 1
+        elif text[pos] == ")":
+            depth -= 1
+            if depth == 0:
+                closing = pos
+                break
+    if closing is None or "\n" not in text[start:closing + 1]:
+        return text
+    signature = re.sub(r"\s+", " ", text[start:closing + 1].strip())
+    return text[:start] + signature + text[closing + 1:]
 
 
 _CODE_PTR_PARAM_RE = re.compile(r"code\s*\*\s*([A-Za-z_]\w*)")
@@ -434,6 +543,7 @@ def _fix_data_ptr_params(params, body):
 
 def parse_signature(text):
     text = _strip_block_comments(text)
+    text = _merge_multiline_signature(text)
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("//"):
@@ -479,6 +589,20 @@ def find_dup_names(decomp_dir, files=None):
     for ret, name, params, path in collect_functions(decomp_dir, files):
         counts[name] = counts.get(name, 0) + 1
     return {n for n, c in counts.items() if c > 1}
+
+
+def find_static_duplicate_definitions(decomp_dir, files=None):
+    """Return duplicate definitions to localize, keeping one linkable owner."""
+    definitions = {}
+    for ret, name, params, path in collect_functions(decomp_dir, files):
+        definitions.setdefault(name, []).append(path)
+    localized = {}
+    for name, paths in definitions.items():
+        if len(paths) < 2:
+            continue
+        for path in sorted(paths)[1:]:
+            localized.setdefault(path, set()).add(name)
+    return localized
 
 
 def find_value_used_voids(decomp_dir, files=None):
@@ -632,15 +756,13 @@ def _repair_code_casts(text):
 def _slice_base(var, arrays, scalars):
     if "." in var or "[" in var:
         return "(char *)&(%s)" % var
-    if var in arrays:
-        return "(char *)%s" % var
-    if var in scalars:
-        return "(char *)&%s" % var
-    return "(char *)%s" % var
+    # 统一取址：数组取 &arr 与 arr 地址相同，标量/未知标识符也按地址解释，
+    # 避免把指针值本身当成字节基址（与 golden 回归口径一致）。
+    return "(char *)&%s" % var
 
 
 def _collect_slice_vars(text, extra_arrays=None):
-    arrays = set(_ARRAY_DECL_RE.findall(text))
+    arrays = {name for name, _count in _ARRAY_DECL_RE.findall(text)}
     if extra_arrays:
         arrays |= set(extra_arrays)
     scalars = set(_SCALAR_DECL_RE.findall(text)) - arrays
@@ -842,7 +964,7 @@ def _repair_struct_casts(text):
 # globally (including local variable declarations like `dirent64 *p;`), unlike
 # `stat`/`flock`/`sigaction` where a bare `\bstat\b` would also match `stat()`.
 _NON_FUNCTION_STRUCT_TAGS = {
-    "dirent", "dirent64", "stat64", "statfs64", "statvfs64", "timezone",
+    "dirent", "dirent64", "timezone",
 }
 
 
@@ -861,7 +983,8 @@ def _repair_struct_decls(text):
 # 在函数体内的局部声明（`stat local_d0;`）也要改成 `struct stat`，但不能误伤
 # 同名函数调用 `stat(...)`。用负向前瞻排除后跟 `(` 的调用。
 _CONFLICTING_STRUCT_TAGS = {
-    "stat", "sigaction", "flock", "statfs", "statvfs", "sysinfo",
+    "stat", "stat64", "sigaction", "flock", "statfs", "statfs64",
+    "statvfs", "statvfs64", "sysinfo",
 }
 
 
@@ -878,7 +1001,7 @@ def _repair_conflicting_struct_decls(text):
 _ARRAY_DECL_RE = re.compile(
     r"\b(?:undefined\d*|signed char|unsigned char|char|byte|uchar|short|ushort|"
     r"word|int|uint|long|ulong|dword|qword|longlong|ulonglong|size_t|code)"
-    r"\s+(?:\*+\s*)?([A-Za-z_]\w*)\s*\[\s*\d*\s*\]"
+    r"\s+(?:\*+\s*)?([A-Za-z_]\w*)\s*\[\s*(0[xX][0-9a-fA-F]+|\d*)\s*\]"
 )
 _ARRAY_ASSIGN_RE = re.compile(r"^(\s*)([A-Za-z_]\w*)\s*=\s*([^=][^;]*);\s*$",
                               re.MULTILINE)
@@ -915,20 +1038,24 @@ def _repair_array_assignments(text, extra_arrays=None):
     局部数组（``undefined1 auVar8[16];`` 之类的向量返回临时变量）和传入的全局
     数组都适用；``arr[i] = expr;`` 不受影响。
     """
-    arr_vars = set(_ARRAY_DECL_RE.findall(text))
-    if extra_arrays:
-        arr_vars |= set(extra_arrays)
-    if not arr_vars:
+    capacities = {name: "sizeof(%s)" % name for name in (extra_arrays or ())}
+    for name, count in _ARRAY_DECL_RE.findall(text):
+        # 数组形参会退化为指针，sizeof(name) 不是它的真实大小。
+        capacities[name] = "sizeof(%s[0]) * (%s)" % (name, count) if count else None
+    if not capacities:
         return text
 
     def repl(m):
         indent, var, expr = m.group(1), m.group(2), m.group(3)
-        if var in arr_vars:
-            return "%s*(undefined8 *)%s = %s;" % (indent, var, expr)
+        capacity = capacities.get(var)
+        if capacity:
+            size = "(%s) < sizeof(undefined8) ? (%s) : sizeof(undefined8)" % (
+                capacity, capacity)
+            # 由 helper 求值一次 RHS，规避对齐、strict-aliasing 与 C99 复合字面量要求。
+            return "%sghidra_copy_scalar(%s, %s, %s);" % (indent, var, expr, size)
         return m.group(0)
 
     return _ARRAY_ASSIGN_RE.sub(repl, text)
-
 
 def _repair_global_names(text, global_names):
     """Ghidra prefixes some data symbols with `_` (e.g. `_bb_common_bufsiz1`);
@@ -957,22 +1084,27 @@ def repair_source_file(src_path, dst_path, value_used=None, global_names=None,
         value_used = find_value_used_voids(src_path.parent)
     text = src_path.read_text(encoding="utf-8", errors="replace")
     text = _strip_block_comments(text)
-    text = sanitize_qualified_names(text)
-    text = _merge_split_array_return(text)
-    text = _repair_anon_func_types(text)
-    text = _repair_code_casts(text)
-    text = _repair_slice_syntax(text, extra_arrays=global_arrays)
-    text = _repair_stack_refs(text)
-    text = _repair_struct_casts(text)
-    text = _repair_struct_decls(text)
-    text = _repair_conflicting_struct_decls(text)
-    text = _repair_aggregate_casts(text)
-    text = _repair_type_aliases(text)
-    text = _widen_pointer_locals(text)
-    text = _repair_funcptr_arrays(text)
-    text = _repair_array_casts(text)
-    text = _repair_array_assignments(text, extra_arrays=global_arrays)
-    text = _repair_global_names(text, global_names)
+    text = _merge_multiline_signature(text)
+
+    def repair_code(code):
+        code = sanitize_qualified_names(code)
+        code = _merge_split_array_return(code)
+        code = _repair_anon_func_types(code)
+        code = _repair_code_casts(code)
+        code = _repair_slice_syntax(code, extra_arrays=global_arrays)
+        code = _repair_stack_refs(code)
+        code = _repair_struct_casts(code)
+        code = _repair_struct_decls(code)
+        code = _repair_conflicting_struct_decls(code)
+        code = _repair_aggregate_casts(code)
+        code = _repair_type_aliases(code)
+        code = _widen_pointer_locals(code)
+        code = _repair_funcptr_arrays(code)
+        code = _repair_array_casts(code)
+        code = _repair_array_assignments(code, extra_arrays=global_arrays)
+        return _repair_global_names(code, global_names)
+
+    text = _transform_c_code(text, repair_code)
     lines = text.splitlines()
 
     name = None
@@ -1005,7 +1137,7 @@ def repair_source_file(src_path, dst_path, value_used=None, global_names=None,
 
     result = "\n".join(lines) + "\n"
     if name in value_used:
-        result = _return_last_call(result)
+        result = _transform_c_code(result, _return_last_call)
     # 内容不变时不重写，保留旧 mtime，使 make 增量编译只编译真正变化的文件
     if dst_path.exists():
         try:
@@ -1390,7 +1522,12 @@ def parse_pe(path):
         rva = va - image_base
         for vaddr, vsize, rawptr, rawsize in sections:
             if vaddr <= rva < vaddr + max(vsize, rawsize):
-                return rawptr + (rva - vaddr)
+                delta = rva - vaddr
+                # 虚拟尾部（vsize > rawsize）在文件里没有对应字节，
+                # 不能映射到后续节/overlay 数据上。
+                if delta >= rawsize:
+                    return None
+                return rawptr + delta
         return None
 
     # 导入表（DataDirectory[1]）：Ghidra 会把 IAT thunk 反编译成与 CRT 同名
@@ -1573,6 +1710,18 @@ def collect_global_usage(text):
     return usage
 
 
+def _unsigned_global_info(binary, name, file_offset, size):
+    """Return an exact-width unsigned declaration and its stored value."""
+    if size not in (1, 2, 4, 8):
+        return None
+    raw = read_raw(binary, file_offset, size)
+    init = None
+    if raw is not None:
+        value = int.from_bytes(raw, binary.get("byteorder", "little"), signed=False)
+        init = "0x%x" % value
+    return ("undefined%d %s" % (size, name), init)
+
+
 def global_info(binary, name, file_offset, size, used_text, usage=None):
     """Return (ctype, initializer_or_None) for a named global."""
     ptr_size = binary.get("pointer_size", 8)
@@ -1599,7 +1748,9 @@ def global_info(binary, name, file_offset, size, used_text, usage=None):
                 return ("undefined8 *%s" % name, None)
             # 位运算占主导（多于取地址/索引）→ 整数；取地址占主导的保持数组。
             if u["bitop"] > 0 and u["bitop"] > u["addr"] + u["index"]:
-                return ("unsigned long %s" % name, None)
+                integer = _unsigned_global_info(binary, name, file_offset, size)
+                if integer is not None:
+                    return integer
 
     if is_array_usage(name, used_text) or size > ptr_size:
         ctype = "unsigned char %s[0x%x]" % (name, size)
@@ -1878,19 +2029,22 @@ def write_globals(binary, decomp_dir, out_path, files=None):
 def write_makefile(out_dir, c_files, exe_name):
     lines = [
         "CC = gcc",
-        "CFLAGS = -w -include ghidra_types.h -include compat.h -include function_prototypes.h -include globals.h -I.",
+        "CFLAGS = -std=gnu11 -w -MMD -MP -include ghidra_types.h -include compat.h -include function_prototypes.h -include globals.h -I.",
         "SRCS = %s" % " ".join(c_files),
         "OBJS = $(SRCS:.c=.o)",
+        "DEPS = $(OBJS:.o=.d)",
         "",
         "%s: $(OBJS)" % exe_name,
         "\t$(CC) -o $@ $(OBJS)",
         "",
-        "%.o: %.c ghidra_types.h compat.h globals.h",
+        "%.o: %.c",
         "\t$(CC) $(CFLAGS) -c $< -o $@",
+        "",
+        "-include $(DEPS)",
         "",
         ".PHONY: clean",
         "clean:",
-        "\trm -f $(OBJS) %s" % exe_name,
+        "\trm -f $(OBJS) $(DEPS) %s" % exe_name,
     ]
     _write_text_if_changed(out_dir / "Makefile", "\n".join(lines) + "\n")
 
@@ -1996,6 +2150,7 @@ def do_all(binary_path, decomp_dir, out_dir, map_path=None):
     write_types(out_dir / "ghidra_types.h")
     write_compat(out_dir / "compat.h")
     dup_names = find_dup_names(decomp_dir, kept)
+    localized_duplicates = find_static_duplicate_definitions(decomp_dir, kept)
     write_prototypes(decomp_dir, out_dir / "function_prototypes.h", kept, dup_names, binary)
     write_globals(binary, decomp_dir, out_dir / "globals.h", kept)
     write_data_defs(binary, decomp_dir, out_dir / "data_defs.c", kept)
@@ -2008,8 +2163,8 @@ def do_all(binary_path, decomp_dir, out_dir, map_path=None):
     for m in re.finditer(r"extern\s+\S.*?\s+([A-Za-z_]\w*)\s*\[", gh_text):
         global_arrays.add(m.group(1))
     for p in kept:
-        repair_source_file(p, out_dir / p.name, value_used, global_names, dup_names,
-                           global_arrays)
+        repair_source_file(p, out_dir / p.name, value_used, global_names,
+                           localized_duplicates.get(p), global_arrays)
 
     write_makefile(out_dir, [p.name for p in kept] + ["data_defs.c"], "rebuilt.exe")
     write_build_ps1(out_dir, [p.name for p in kept] + ["data_defs.c"], "rebuilt.exe")
