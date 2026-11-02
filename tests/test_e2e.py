@@ -77,3 +77,19 @@ class TestEndToEnd:
                     encoding="utf-8").read()
         assert "typedef long long          longlong;" in text
         assert "typedef unsigned char      uchar;" in text
+
+
+@pytest.mark.skipif(platform.system() != "Linux" or not shutil.which("objcopy"), reason="Linux object comparison")
+def test_restored_variadic_fixture_matches_original_object(tmp_path):
+    """Check integer, pointer and floating-point varargs against the actual fixture ELF."""
+    harness = tmp_path / "harness.c"
+    harness.write_text('void log_message(int, const char *, ...);\n'
+                       'int main(void) { log_message(4, "%s %d %.1f", "value", -2, 1.5); }\n')
+    original = tmp_path / "original.o"
+    subprocess.run(["objcopy", "--redefine-sym", "main=fixture_original_main",
+                    "--globalize-symbol", "log_message", BINARY, str(original)], check=True)
+    reference, repaired = tmp_path / "reference", tmp_path / "repaired"
+    subprocess.run(["gcc", "-no-pie", str(harness), str(original), "-lm", "-o", str(reference)], check=True)
+    subprocess.run(["gcc", "-include", "stdio.h", "-include", "stdarg.h", str(harness),
+                    os.path.join(DECOMP_DIR, "log_message.c"), "-o", str(repaired)], check=True)
+    assert subprocess.check_output([str(repaired)]) == subprocess.check_output([str(reference)]) == b"[4] value -2 1.5\n"

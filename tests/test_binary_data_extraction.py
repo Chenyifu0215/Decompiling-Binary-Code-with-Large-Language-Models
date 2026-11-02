@@ -55,3 +55,38 @@ def test_pe_virtual_tail_does_not_map_to_overlay_bytes(tmp_path):
 
     assert binary["va_to_offset"](0x140001080) == 0x280
     assert binary["va_to_offset"](0x140001180) is None
+
+
+def test_dat_object_bounds_and_file_backed_tail(tmp_path):
+    use = tmp_path / "use.c"
+    use.write_text("void *p = DAT_1001; void *q = DAT_2000; void *r = DAT_3000;")
+    data = b"\x01\x00\x02\x03OVERLAY" + b"hello\0\0" + b"A\0B\0"
+    def offset(address):
+        if 0x1000 <= address < 0x1004: return address - 0x1000
+        if 0x2000 <= address < 0x2007: return 11 + address - 0x2000
+        if 0x3000 <= address < 0x3004: return 18 + address - 0x3000
+        return None
+    binary = {"data": data, "va_to_offset": offset,
+              "globals": {"message": (11, 7), "bytes": (18, 4)}}
+    assert dict((addr, (is_string, raw)) for addr, is_string, raw in dh.dat_entries(binary, tmp_path, [use])) == {
+        "1001": (False, b"\x00\x02\x03"),
+        "2000": (True, b"hello\0"),
+        "3000": (False, b"A\0B\0"),
+    }
+
+
+def test_printable_binary_array_keeps_exact_size(tmp_path):
+    use = tmp_path / "use.c"
+    use.write_text("int f(void) { return DAT_1000[3]; }")
+    binary = {"data": b"ABCD", "globals": {"blob": (0, 4)},
+              "va_to_offset": lambda addr: addr - 0x1000 if 0x1000 <= addr < 0x1004 else None}
+    assert dh.dat_entries(binary, tmp_path, [use]) == [("1000", False, b"ABCD")]
+
+
+def test_padded_string_rebuild_preserves_object_size(tmp_path):
+    use = tmp_path / "use.c"
+    use.write_text("int f(void) { return DAT_1000[3]; }")
+    binary = {"data": b"A\0\0\0", "globals": {"blob": (0, 4)},
+              "va_to_offset": lambda addr: addr - 0x1000 if 0x1000 <= addr < 0x1004 else None}
+    address, is_string, raw = dh.dat_entries(binary, tmp_path, [use])[0]
+    assert is_string and raw + b"\0" == binary["data"]

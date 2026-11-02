@@ -16,22 +16,34 @@
 
 ## 文件夹分类原则
 
+本地工作区将插件仓库、Ghidra 工具和项目资料分开放置：
+
 ```text
-.
-├── plugins/   项目实现：核心模块、CLI、GUI、配置示例和使用说明
-├── tests/     项目验证：测试代码、固定样本、错误资料和实验结果
-├── ignore/    本地内容：第三方工具、虚拟环境、生成物、配置和私有资料
-├── README.md  项目总览与入口文档
-└── .gitignore Git 忽略规则
+student_create/                  工作区容器，不是 Git 仓库
+├── plugin_project/              插件 Git 仓库；在这里运行 Git 和下文命令
+│   ├── .git/                    原有提交历史、分支和远程配置
+│   ├── plugins/                 核心模块、CLI、GUI、配置示例和使用说明
+│   ├── tests/                   测试代码、固定样本和实验资料
+│   ├── ignore/                  可再生成的本地环境和运行产物（按需创建）
+│   ├── README.md
+│   └── .gitignore
+├── ghidra_tools/                Ghidra 工具与运行依赖，位于 Git 仓库外
+│   ├── ghidra_12.2_PUBLIC/
+│   ├── jdk-25/                 Linux JDK 25
+│   ├── python_env/             Linux Python 虚拟环境
+│   ├── qt_libs/                Linux GUI 共享库
+│   └── runtime/                运行时设置与缓存
+└── project_docs/                申报书、报告等个人项目文档，位于 Git 仓库外
 ```
 
 分类遵循以下原则：
 
 - 能构成项目功能、需要协作维护的实现代码和公开说明放入 `plugins/`。
 - 用于验证功能或记录实验表现的测试代码、输入样本和结果放入 `tests/`。
-- 可重新安装或重新生成、与具体电脑有关、包含个人信息或不应公开的内容放入 `ignore/`。
-- `ignore/` 整体不进入 Git；当前细分为 `tools/`、`envs/`、`generated/`、`local/` 和 `private/`。
-- `.agents/`、`.codex/` 是工作环境挂载点，无法移动，因此留在根目录并由 `.gitignore` 忽略。
+- Ghidra 本体放入仓库同级的 `../ghidra_tools/`；申报书等不可再生成的资料放入 `../project_docs/`，并另行备份。
+- `ignore/` 整体不进入 Git，仅用于可再生成的环境、构建结果和日志；不要把唯一一份项目文档放在这里。
+- `.agents/`、`.codex/`、`.aws/` 是工作环境挂载点，保留在外层工作区目录。
+- 目录迁移保留原远程地址和分支关联。在外层目录操作时使用 `git -C plugin_project status`；也可以先 `cd plugin_project` 再运行 Git。编辑器应打开 `plugin_project/` 作为代码仓库。
 
 ## 环境要求
 
@@ -52,35 +64,57 @@
 - PyYAML：使用 `decompile_binary.py --config` 读取 YAML 配置时需要；JSON 配置无需此依赖
 - OpenAI Chat Completions 兼容接口：运行 LLM 修复功能；默认配置面向 DeepSeek
 
-本地依赖推荐采用如下布局：
+本工作区的 Linux/WSL 环境采用如下布局：
 
 ```text
-ignore/
-├── tools/ghidra12.1/
-└── envs/pyghidra_env/
+../ghidra_tools/ghidra_12.2_PUBLIC/  Ghidra，位于仓库之外
+../ghidra_tools/jdk-25/             JDK 25
+../ghidra_tools/python_env/         Python 3.12 虚拟环境
+../ghidra_tools/qt_libs/            GUI 所需的用户级共享库
 ```
 
-项目会自动尝试查找 `ignore/tools/ghidra12.1`。也可以显式指定：
+程序优先使用有效的 `GHIDRA_INSTALL_DIR`，否则尝试仓库同级 `ghidra_tools/current/` 和 `ghidra_tools/ghidra_*/` 中的安装目录。保留多个版本时，应显式指定使用哪个版本。Linux/WSL 下从插件仓库目录执行：
 
 ```bash
-export GHIDRA_INSTALL_DIR="$PWD/ignore/tools/ghidra12.1"
+export GHIDRA_INSTALL_DIR="$(cd ../ghidra_tools/ghidra_12.2_PUBLIC && pwd)"
 ```
 
-如果 PyGhidra 安装在项目的本地虚拟环境中，可直接使用该解释器：
+Windows PowerShell 下从插件仓库目录执行：
+
+```powershell
+$env:GHIDRA_INSTALL_DIR = (Resolve-Path ..\ghidra_tools\ghidra_12.2_PUBLIC).Path
+```
+
+[Ghidra 12.2 官方发行版](https://github.com/NationalSecurityAgency/ghidra/releases/tag/Ghidra_12.2_build)要求 64 位 JDK 25；旧版所用的 Java 21 不满足该版本要求。PyGhidra 需要安装在实际运行插件的 Python 环境中。这里的 JDK、Python 环境和 Qt 共享库用于 Linux/WSL，Windows 原生运行需另行配置 Windows 依赖，不能直接复用 Linux 虚拟环境。
+
+已配置的工作区建议通过启动脚本运行，它会设置专用 Java、Python、Ghidra 路径，并优先使用系统 GCC，避免误用 Conda 编译器：
 
 ```bash
-ignore/envs/pyghidra_env/bin/python plugins/decompile_binary.py --help
+# 从 plugin_project/ 执行；无参数时启动桌面界面（需要 WSLg 或 Linux 桌面）
+./scripts/run.sh
+
+# 命令行与测试也使用同一环境
+./scripts/run.sh python plugins/decompile_binary.py --help
+./scripts/run.sh python -m pytest -q -p no:cacheprovider tests
 ```
 
-在新环境中，应自行创建虚拟环境，并按照所用 Ghidra 版本的说明安装 PyGhidra。GUI 和测试依赖可按需安装：
+启动脚本仅配置当前子进程，不修改系统默认 Java 或用户 shell 配置。Ghidra 的设置和缓存分别保存在 `../ghidra_tools/runtime/config/` 和 `../ghidra_tools/runtime/cache/`。
+
+在新环境中，创建 `../ghidra_tools/python_env/` 后，可以使用锁定的依赖清单和 Ghidra 自带的 PyGhidra wheel 恢复 Python 依赖：
 
 ```bash
-python -m pip install PySide6 pytest
+uv pip install --python ../ghidra_tools/python_env/bin/python \
+  --find-links ../ghidra_tools/ghidra_12.2_PUBLIC/Ghidra/Features/PyGhidra/pypkg/dist \
+  -r requirements.txt
 ```
+
+LLM 修复仍需自行设置 `LLM_API_KEY`（以及可选的 `LLM_BASE_URL`、`LLM_MODEL`）；这些值会由启动脚本继承，不写入仓库。未配置 API Key 时可使用 `--proposer fallback`。
+
+本地环境的版本和验证摘要记录在 `../ghidra_tools/environment.json`。2026-11-02 的验证已通过小型 ELF 样本的反编译、工程生成、编译与运行，以及 WSLg 窗口启动；测试集为 179 通过、2 失败（数据提取中的零字节保留、固定样本的 `log_message` 参数数量），这些代码问题仍待修复。
 
 ## 快速开始
 
-以下命令都从仓库根目录执行。`sample.exe` 和 `./binaries` 是占位路径，请换成真实输入；扩展名不决定其实际二进制格式。`python` 必须指向安装了所需依赖的解释器，例如将它替换为 `ignore/envs/pyghidra_env/bin/python`。示例把运行结果写入 `ignore/generated/`，避免误提交生成物。
+以下命令都从仓库根目录执行。`sample.exe` 和 `./binaries` 是占位路径，请换成真实输入；扩展名不决定其实际二进制格式。已配置的 Linux/WSL 工作区请将下文命令的 `python` 替换为 `./scripts/run.sh python`，以加载完整运行环境。示例把运行结果写入 `ignore/generated/`，避免误提交生成物。
 
 ### 1. 反编译二进制文件
 
@@ -391,11 +425,204 @@ ELF64 x86-64 动态可执行文件：上游已 strip 的直接进 `target/`；�
   的 `--map`（map 含真实段名）、以及 `symbols.json` 派生的任何锚点。
 
 
+## 动态修复 V1（已实现）
+
+申报书中“静态编译修复 → 运行时检测 → 反馈修复”的第二阶段现已提供可运行实现。
+入口是 `plugins/dynamic_repair.py`，桌面界面新增“动态修复（配置文件）”和“打开动态报告”。
+当前处理 **Linux/WSL2 x86-64 ELF、可确定输出的单进程 C 命令行程序**。
+输入应为静态修复后已经能够编译的工程，参考程序必须是可执行 ELF，不能直接使用 `.o`。
+
+流程为：冻结源文件与参考二进制 → 检查编译器和 sanitizer 环境 → 重复运行参考用例 →
+普通/ASan+UBSan 双构建 → 收集错误 → 生成候选补丁 → 双构建与全部修复用例回归 →
+接受严格改善的补丁 → 最后执行独立评估。原始输入工程不会被直接修改。
+
+### 先运行离线演示
+
+在 `plugin_project/` 中：
+
+```bash
+./scripts/run.sh python scripts/demo_dynamic.py
+```
+
+演示会创建唯一的 `ignore/dynamic-demo/<时间-随机串>/`，编译参考程序，并依次回放两个补丁：
+先拒绝改变合法错误退出码的补丁，再接受修复堆数组越界的补丁，最后执行独立用例。
+这是**人工注入缺陷的基础设施演示**，不能用来声称真实 Ghidra 修复率或 LLM 修复效果。
+命令会打印配置文件和 HTML 报告的路径；同一个配置也可在 GUI 中选择运行。
+
+### 配置自己的工程
+
+配置文件中的路径均相对于该 YAML 所在目录解析。以下配置可直接按实际目录填写：
+
+```yaml
+schema_version: 1
+project_id: my-program
+target:
+  source_dir: ./static_build
+  reference_binary: ./target/original
+build:
+  compiler: gcc
+  # sources: [main.c, data_defs.c]  # 可省略：读取 helper 的静态 SRCS 列表或发现 .c
+  # force_include: []             # 可省略：自动识别 helper 的四个兼容头文件
+  libraries: [m]
+  timeout_seconds: 60
+execution:
+  timeout_seconds: 3
+  instrumented_timeout_seconds: 10
+  max_output_bytes: 1048576
+  reference_repeats: 2
+  compare_stderr: false
+  environment: {LC_ALL: C, TZ: UTC}
+tests:
+  repair_manifest: ./cases/repair.json
+repair:
+  proposer: llm                  # none 只评估；replay 回放离线补丁
+  max_attempts: 10
+  max_no_progress: 3
+  max_llm_calls: 10
+  max_total_tokens: 30000
+  max_completion_tokens: 2000
+  max_files_per_patch: 3
+  max_total_seconds: 600
+artifacts:
+  output_dir: ./runs             # 不得与 source_dir 相互包含
+  keep_rejected_candidates: false
+```
+
+普通编译固定为 `-std=gnu11 -O1 -g`；插桩编译额外使用
+`-fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all -fno-pie -no-pie`，
+编译与链接同时插桩。使用非 PIE 插桩程序减少 ASan shadow address 冲突；普通构建遵循编译器默认 PIE 设置。
+当前不执行任意自定义 Makefile，也不自动支持 C++、额外资源目录或复杂链接配方。
+只复制 `.c`/`.h` 文件，拒绝源目录符号链接，源文件总量上限为 8 MiB。
+
+用例清单为 UTF-8 JSON：
+
+```json
+{
+  "schema_version": 1,
+  "cases": [
+    {"id": "empty", "args": [], "stdin": ""},
+    {"id": "file_input", "args": ["input.txt"], "stdin": "",
+     "files": {"input.txt": "1 2 3\n"}, "output_files": ["result.txt"]}
+  ]
+}
+```
+
+每次执行使用新的临时工作目录；支持字符串参数、UTF-8 标准输入和输入文件。
+退出码、stdout 原始字节和声明的输出文件内容哈希必须与参考程序一致；stderr 比较可选。
+参考程序的正常非零退出码有效。参考程序崩溃、超时、超出输出限制或重复执行结果不一致时，结果不可验证。
+运行器限制墙钟时间和捕获输出量，并清理进程组；它不是安全沙箱，不支持恶意程序隔离，样本应当可信。
+程序主动创建新会话、后台守护进程、网络服务或非确定性程序不在 V1 支持范围内。
+
+```bash
+# 有真实 LLM_API_KEY 时使用 llm；沿用 LLM_BASE_URL、LLM_MODEL 配置。
+# 不需要 LLM 时，将配置中的 proposer 改为 none。
+./scripts/run.sh python plugins/dynamic_repair.py \
+  --config /path/to/config.yaml \
+  --evaluation-manifest /path/to/cases/heldout.json
+```
+
+独立评估清单只在修复循环结束后加载与执行，其结果不进入下一轮补丁反馈；不得与修复清单重复输入。
+输入按 `args`、`stdin`、`files` 比较；改用例 ID 或 `output_files` 不会变成新的独立输入。
+不传该选项时，即使所有修复用例通过，也只报告 `REPAIR_TESTS_PASSED`。
+`max_total_tokens` 使用提示 UTF-8 字节数加回复上限的保守预算预留，并记录接口实际 usage；
+这不是模型专用 tokenizer 的精确计费上限。无效补丁、请求失败和缓存返回都计入尝试/请求预算。
+总运行时限同时覆盖模型响应等待；Linux 后端用进程定时器中断超时，退出时清理子进程并恢复信号处理器。
+因此在应用中应通过独立进程调用动态 CLI，不要直接在 Python 工作线程内运行控制器。
+V1 只接受现有源文件上的唯一精确文本替换，拒绝路径越界、批量正则和测试/配置文件修改。
+门禁要求失败的“用例/构建类型/问题类别”集合严格缩小，不允许引入新的失败项。
+sanitizer 通常只报告遇到的第一个错误，严格门禁可能拒绝“修复一个错误但暴露另一个错误”的补丁；
+因此 V1 优先保守保留行为，不能保证能连续修复所有多缺陷程序。
+
+### 结果和运行记录
+
+| 状态 | 含义 |
+| --- | --- |
+| `TEST_VALIDATED` | 修复用例和独立评估用例均通过；不等于证明程序语义等价 |
+| `REPAIR_TESTS_PASSED` | 修复用例通过，未提供独立评估 |
+| `PARTIAL` | 已有被接受的改善，但仍有失败或预算耗尽 |
+| `NO_PROGRESS` | 没有获得可接受的改善，或仅评估发现失败 |
+| `STATIC_BLOCKED` | 基线普通构建或插桩构建不能编译 |
+| `UNVERIFIED` | 缺少参考/用例，或参考/独立评估无效 |
+| `ENVIRONMENT_ERROR` | 工具链、配置或模型凭据等条件不满足 |
+| `CANCELLED` | 任务被取消，已接受快照保留 |
+
+每次运行单独生成：
+
+```text
+runs/<时间-随机串>/
+  manifest.json          # 配置、环境、工具/输入哈希与模型名
+  inputs/                # 冻结的参考二进制、修复清单和回放补丁
+  probe/                 # sanitizer 可用性预检
+  baseline/              # 原始源快照、双构建日志及用例结果
+  attempts/0001/         # 每轮证据、补丁、diff、构建结果和接受/拒绝原因
+  best/                  # 最佳源代码与两个可执行版本
+  accepted_patches.jsonl # 按顺序记录接受的补丁；有接受时才产生
+  results.json           # 最终状态、预算与逐用例结果；原始输出以 base64 保存
+  report.html            # 可直接打开的结果表格与补丁决策
+```
+
+默认移除被拒绝候选的源码副本和可执行文件，保留日志、diff 和决策证据。
+采纳新版本时使用目录重命名切换最佳快照；原始工程和基线快照保留。
+若运行环境限制 ptrace，LeakSanitizer 可能无法工作，预检会报告环境错误；不会通过关闭检查伪造通过。
+
+### Linux、Windows 与 GUI
+
+- Linux/WSL：直接运行同一套 Python 后端，依赖 GCC、ASan/UBSan runtime 和 PyYAML。
+- Windows：`python plugins/dynamic_repair.py --config config.yaml` 自动通过 `wsl.exe` 调用同一入口。
+  配置内使用相对路径；可指定 `--wsl-distribution Ubuntu --wsl-python /path/to/venv/bin/python`。
+  `--wsl-python` 默认是 WSL 的 `python3`，它必须已装 PyYAML。
+- Windows GUI 使用环境变量 `DYNAMIC_WSL_PYTHON`、`DYNAMIC_WSL_DISTRIBUTION` 选择同一环境。
+  先选择 YAML，再选择可选的独立评估 JSON；取消第二个选择框表示只执行修复测试。
+- Linux/WSL 后端与 Qt 界面动作已在当前 WSL 环境验证；Windows 路径转换/委托有自动化测试，原生 Windows GUI、
+  真实 WSL 发行版选择及 Windows 强制取消仍需在 Windows 交互会话联调，不能据此声称已全面适配。
+
+### 新增模块职责
+
+| 文件 | 职责 |
+| --- | --- |
+| `plugins/dynamic_repair.py` | CLI、Windows→WSL 委托、取消信号与退出状态 |
+| `plugins/dynamic/config.py` | YAML/用例 schema 校验、相对路径和预算配置 |
+| `plugins/dynamic/builder.py` | 识别 helper 编译单元、双构建和编译日志 |
+| `plugins/dynamic/runner.py` | 隔离工作目录、输入输出、超时/输出上限、进程组清理 |
+| `plugins/dynamic/diagnostics.py` | 识别 ASan/UBSan、信号和执行失败；定义行为比较字段 |
+| `plugins/dynamic/oracle.py` | 稳定性检查、参考行为采集和逐用例评估 |
+| `plugins/dynamic/evidence.py` | 构造有上限的源码与运行证据，不加入独立评估反馈 |
+| `plugins/dynamic/workspace.py` | 源快照、哈希、事务式补丁校验与差异记录 |
+| `plugins/dynamic/validator.py` | 严格改善与无回归的接受门禁 |
+| `plugins/dynamic/controller.py` | 状态机、预算、最佳版本切换与最终评估 |
+| `plugins/dynamic/report.py` | JSON 结果和可独立打开的 HTML 报告 |
+| `plugins/llm.py` | 复用模型连接，新增 `propose_runtime_fix` 接口 |
+| `scripts/demo_dynamic.py` | 构建离线合成样本并运行完整演示 |
+| `tests/dynamic_cases/` | 参考源、人工缺陷源、修复/独立清单和回放配置 |
+| `tests/test_dynamic.py` | 真实编译、回归/预算/路径/超时/模型接口等验证 |
+| `tests/test_dynamic_audit.py` | 独立用例去重、版本切换故障、模型异常、文件保护及取消/时限边界回归 |
+| `tests/test_dynamic_gui.py` | Qt 按钮到后端的集成、关闭等待、结果加载与提前取消 |
+
+申报书后续的 Referee/Advisor/Operator 多角色可读性重构、MSSC 评估及大型真实样本修复率实验，
+仍属于下一阶段；本轮交付不把这些尚未实现的部分算入完成进度。
+
+2026-11-02 验证记录：全量测试 `210 passed`（Qt 旧字体 API 有 6 条弃用提示）；
+离线演示验证了拒绝回归、接受修复与独立测试；一个真实 Ghidra 12.2 生成的小型 C 工程也完成双构建和独立行为对照。
+Qt 验证通过 offscreen 平台实际触发按钮和后台 CLI。未配置在线模型密钥，因此不声称已验证真实 LLM 的修复效果。
+
+同日审核追加：全量回归为 **233 passed，无警告**。新增 23 项回归测试，修正了以下问题：
+
+- 独立评估改变输出检查项时，重复输入可能被错误计入独立验证。
+- 快照复制/重命名失败、取消与提交同时发生时，最佳版本和“已接受”记录可能不一致。
+- 模型接口异常 JSON 结构导致未捕获异常；缓存未区分服务端点与回复预算；网络等待缺少总时限中断。
+- `--result-file` 可能覆盖输入源文件；配置空路径、布尔版本号和非法文件名校验不足。
+- 普通程序错误文本可能被误当成 sanitizer 报告；已知大小的数据对象可能丢失零填充或被添加额外终止字节。
+- GUI 提前取消可能漏掉尚未启动的任务，关闭时可能销毁仍运行的线程，损坏的结果文件可能使槽函数异常退出。
+
+JSON 结果现使用临时文件加原子替换写入；原始源码和接受前基线仍保留。
+离线演示及现有真实 Ghidra 小样本动态验证均再次通过，Git 完整性检查未发现损坏（历史悬空对象保留）。
+本次审核没有推进多角色优化等后续功能；在线 LLM 效果和真实 Windows 交互会话仍不在已验证范围内。
+
 ## 推荐开发约定
 
 - 从仓库根目录运行文档中的命令，便于路径保持一致。
 - 新的项目实现、CLI 和公开使用说明放入 `plugins/`。
 - 新的测试代码与可复现的小型测试样本放入 `tests/`。
-- Ghidra、虚拟环境、反编译输出、构建目录、日志和私人文档放入 `ignore/`。
+- Ghidra 放入 `../ghidra_tools/`，申报书等项目资料放入 `../project_docs/`；虚拟环境、反编译输出、构建目录和日志可放入 `ignore/`。
 - 运行 `git status` 后，只提交源码、公开文档与必要测试资产；不要提交 API Key、本机路径或大体积可再生成文件。
 - 修改实现后至少运行 `python -m py_compile plugins/*.py`；具备 pytest 环境时再运行相关测试。

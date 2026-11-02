@@ -21,7 +21,14 @@ decompile_binary.py 用法说明
 
 1. 设置 Ghidra 安装路径（环境变量或 --ghidra-dir）：
 
-   $env:GHIDRA_INSTALL_DIR = "C:\ghidra\ghidra12.1"
+   # 从 plugin_project 仓库根目录执行（Windows PowerShell）
+   $env:GHIDRA_INSTALL_DIR = (Resolve-Path ..\ghidra_tools\ghidra_12.2_PUBLIC).Path
+
+   # Linux/WSL，从 plugin_project 仓库根目录执行
+   export GHIDRA_INSTALL_DIR="$(cd ../ghidra_tools/ghidra_12.2_PUBLIC && pwd)"
+
+   未显式指定时，程序也会查找仓库同级 ghidra_tools/ 下的安装。
+   Ghidra 12.2 需要 64 位 JDK 25。
 
 2. 安装 pyghidra 包（从 Ghidra 自带的 PyGhidra 功能安装）
 
@@ -63,7 +70,8 @@ python decompile_binary.py binary.exe --list-functions
 python decompile_binary.py sample.exe --no-analyze -o ./out
 
 # 指定 Ghidra 安装目录
-python decompile_binary.py sample.exe --ghidra-dir "C:\ghidra\ghidra12.1" -o ./out
+# 下例从 plugin_project/plugins/ 目录运行
+python decompile_binary.py sample.exe --ghidra-dir "../../ghidra_tools/ghidra_12.2_PUBLIC" -o ./out
 
 # 使用配置文件
 python decompile_binary.py ./targets -o ./out --config decompile_config.json

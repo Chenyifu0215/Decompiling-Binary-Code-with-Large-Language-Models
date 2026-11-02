@@ -1,0 +1,4 @@
+[
+  [{"op": "replace", "file": "main.c", "old": "return 7;", "new": "return 0;"}],
+  [{"op": "replace", "file": "main.c", "old": "i <= n", "new": "i < n"}]
+]

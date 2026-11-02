@@ -221,7 +221,13 @@ def find_ghidra_install() -> Optional[Path]:
     if env and Path(env).is_dir():
         return Path(env)
 
+    # The shared tool directory is outside the Git repository. Resolve from
+    # this script so discovery also works when launched from another cwd.
+    tools_dir = Path(__file__).resolve().parents[2] / "ghidra_tools"
+    installs = sorted(p for p in tools_dir.glob("ghidra_*") if p.is_dir())
     candidates = [
+        tools_dir / "current",
+        *reversed(installs),
         Path(__file__).resolve().parent,
         Path.home() / "ghidra",
         Path("C:/ghidra") if sys.platform == "win32" else None,

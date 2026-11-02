@@ -1,0 +1,25 @@
+# Copy this directory to a disposable workspace and compile reference.c first.
+# scripts/demo_dynamic.py performs these steps automatically.
+schema_version: 1
+project_id: synthetic-off-by-one
+target:
+  source_dir: ./source
+  reference_binary: ./reference
+build:
+  compiler: gcc
+  sources: [main.c]
+  force_include: []
+execution:
+  timeout_seconds: 3
+  instrumented_timeout_seconds: 10
+  reference_repeats: 2
+tests:
+  repair_manifest: ./repair.json
+repair:
+  proposer: replay
+  replay_file: ./replay.json
+  max_attempts: 3
+  max_no_progress: 2
+artifacts:
+  output_dir: ./runs
+  keep_rejected_candidates: false

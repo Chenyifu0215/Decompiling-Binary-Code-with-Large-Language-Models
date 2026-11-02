@@ -12,17 +12,20 @@
 """
 
 import logging
+import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal, QObject, QDir, QUrl, QSortFilterProxyModel
 from PySide6.QtGui import (
     QDragEnterEvent, QDropEvent, QSyntaxHighlighter, QTextCharFormat,
-    QColor, QFont, QFontDatabase, QAction,
+    QColor, QFont, QFontDatabase, QAction, QDesktopServices,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -65,7 +68,7 @@ class CHighlighter(QSyntaxHighlighter):
         def fmt(color, bold=False, italic=False):
             f = QTextCharFormat()
             f.setForeground(QColor(color))
-            f.setFontFamily(mono.family())
+            f.setFontFamilies([mono.family()])
             if bold:
                 f.setFontWeight(QFont.Bold)
             if italic:
@@ -112,10 +115,19 @@ class TaskThread(QThread):
         self.cmd = cmd
         self._proc = None
         self._buf = []
+        self._cancel_requested = threading.Event()
 
     def cancel(self):
+        self._cancel_requested.set()
         if self._proc is not None and self._proc.poll() is None:
             try:
+                if os.name != "nt":
+                    # The dynamic controller handles TERM and cleans its child groups.
+                    if self.kind == "dynamic":
+                        self._proc.terminate()
+                    else:
+                        os.killpg(self._proc.pid, signal.SIGTERM)
+                    return
                 # 杀整个进程树（python -> wsl -> make -> gcc）
                 subprocess.run(
                     ["taskkill", "/pid", str(self._proc.pid), "/T", "/F"],
@@ -130,6 +142,9 @@ class TaskThread(QThread):
 
     def run(self):
         self.log.emit("$ " + " ".join(self.cmd))
+        if self._cancel_requested.is_set():
+            self.done.emit(self.kind, False, "启动前已取消")
+            return
         try:
             proc = subprocess.Popen(
                 self.cmd,
@@ -140,12 +155,15 @@ class TaskThread(QThread):
                 errors="replace",
                 bufsize=1,
                 cwd=str(SCRIPT_DIR),
+                start_new_session=os.name != "nt",
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             )
         except Exception as e:
             self.done.emit(self.kind, False, "启动失败: %s" % e)
             return
         self._proc = proc
+        if self._cancel_requested.is_set():
+            self.cancel()
         import time
         self._buf = []
         last_flush = time.time()
@@ -264,6 +282,7 @@ class MainWindow(QMainWindow):
         self.map_path = None
         self.work_dir = None
         self.worker = None
+        self._close_pending = False
         self._dark = True
         self._bg_color = QColor("#1e1e1e")
 
@@ -317,6 +336,11 @@ class MainWindow(QMainWindow):
         self.btn_build = QPushButton("生成可编译工程")
         self.btn_repair = QPushButton("静态修复")
         self.btn_sigfix = QPushButton("签名修复")
+        self.btn_dynamic = QPushButton("动态修复（配置文件）")
+        self.btn_dynamic_report = QPushButton("打开动态报告")
+        self.btn_dynamic_report.setEnabled(False)
+        self._dynamic_report = None
+        self._dynamic_result_file = None
         self.btn_cancel = QPushButton("取消")
         self.btn_open_dir = QPushButton("打开输出目录")
         self.btn_clear = QPushButton("清除")
@@ -344,6 +368,15 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.sigfix_spin)
         btn_row.addStretch(1)
         iv.addLayout(btn_row)
+
+        runtime_row = QHBoxLayout()
+        runtime_row.addWidget(self.btn_dynamic)
+        runtime_row.addWidget(self.btn_dynamic_report)
+        runtime_row.addWidget(QLabel("选择 YAML 配置；独立测试可选；状态和报告见日志"))
+        runtime_row.addStretch(1)
+        iv.addLayout(runtime_row)
+        self.btn_dynamic.clicked.connect(self.on_dynamic)
+        self.btn_dynamic_report.clicked.connect(self.on_dynamic_report)
 
         self.btn_open.clicked.connect(self.on_open_file)
         self.btn_dir.clicked.connect(self.on_choose_dir)
@@ -545,7 +578,7 @@ class MainWindow(QMainWindow):
 
     def on_open_dir(self):
         if self.work_dir and Path(self.work_dir).exists():
-            os.startfile(str(self.work_dir))
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.work_dir)))
         else:
             QMessageBox.information(self, "提示", "还没有输出目录")
 
@@ -656,10 +689,39 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _set_busy(self, busy):
+        self.file_list.setEnabled(not busy)
+        self.setAcceptDrops(not busy)
         for b in (self.btn_decompile, self.btn_build, self.btn_repair,
-                  self.btn_sigfix, self.btn_open, self.btn_dir, self.btn_map):
+                  self.btn_sigfix, self.btn_open, self.btn_dir, self.btn_map,
+                  self.btn_dynamic, self.btn_clear):
             b.setEnabled(not busy)
         self.btn_cancel.setEnabled(busy)
+        if not busy:
+            self._sync_paths()
+
+    def on_dynamic(self):
+        config, _ = QFileDialog.getOpenFileName(self, "选择动态修复配置", filter="YAML (*.yaml *.yml)")
+        if not config:
+            return
+        self._dynamic_report = None
+        self.btn_dynamic_report.setEnabled(False)
+        evaluation, _ = QFileDialog.getOpenFileName(
+            self, "可选：选择独立评估清单（取消则只运行修复测试）", filter="JSON (*.json)")
+        self._dynamic_result_file = str(Path(self._empty_dir) / "dynamic-result.json")
+        Path(self._dynamic_result_file).unlink(missing_ok=True)
+        cmd = [sys.executable, str(SCRIPT_DIR / "dynamic_repair.py"), "--config", config,
+               "--result-file", self._dynamic_result_file]
+        if evaluation:
+            cmd += ["--evaluation-manifest", evaluation]
+        if os.name == "nt" and os.environ.get("DYNAMIC_WSL_PYTHON"):
+            cmd += ["--wsl-python", os.environ["DYNAMIC_WSL_PYTHON"]]
+        if os.name == "nt" and os.environ.get("DYNAMIC_WSL_DISTRIBUTION"):
+            cmd += ["--wsl-distribution", os.environ["DYNAMIC_WSL_DISTRIBUTION"]]
+        self._start_task("dynamic", cmd)
+
+    def on_dynamic_report(self):
+        if self._dynamic_report:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._dynamic_report))
 
     def on_decompile(self):
         cmd = [sys.executable, str(SCRIPT_DIR / "decompile_binary.py")]
@@ -703,6 +765,25 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         status = "成功" if ok else "失败"
         self.append_log("[%s] %s (%s)" % (kind, status, message))
+        if kind == "dynamic" and self._dynamic_result_file and Path(self._dynamic_result_file).exists():
+            try:
+                data = json.loads(Path(self._dynamic_result_file).read_text(encoding="utf-8"))
+                run_dir = data["run_dir"]
+                if os.name == "nt":
+                    command = ["wsl.exe"]
+                    if os.environ.get("DYNAMIC_WSL_DISTRIBUTION"):
+                        command += ["--distribution", os.environ["DYNAMIC_WSL_DISTRIBUTION"]]
+                    run_dir = subprocess.check_output(command + ["--exec", "wslpath", "-w", run_dir],
+                                                      text=True, encoding="utf-8", timeout=10).strip()
+                report = Path(run_dir) / "report.html"
+                self.append_log("动态结果：%s — %s" % (data["status"], data["reason"]))
+                self._dynamic_report = str(report) if report.is_file() else None
+                self.btn_dynamic_report.setEnabled(self._dynamic_report is not None)
+                self._refresh_tree(run_dir, str(Path(run_dir) / "results.json"))
+            except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+                self._dynamic_report = None
+                self.btn_dynamic_report.setEnabled(False)
+                self.append_log("无法加载动态结果：" + str(exc))
         if kind == "decompile":
             self._refresh_tree(self.decomp_dir or self.work_dir)
             if ok:
@@ -759,7 +840,13 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self.worker is not None and self.worker.isRunning():
             self.worker.cancel()
-            self.worker.wait(2000)
+            if not self.worker.wait(2000):
+                if not self._close_pending:
+                    self._close_pending = True
+                    self.worker.finished.connect(self.close)
+                self.append_log("正在清理后台任务，完成后关闭窗口")
+                event.ignore()
+                return
         if getattr(self, "_empty_dir", None) and Path(self._empty_dir).exists():
             shutil.rmtree(self._empty_dir, ignore_errors=True)
         event.accept()

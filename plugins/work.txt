@@ -35,7 +35,8 @@ Ghidra 静态反编译修复工程 - 使用说明 (work.txt)
 三、环境依赖
 --------------------------------------------------------------------------------
   - Python 3.12 + PyGhidra（Ghidra 12.1 安装）+ PySide6（GUI）
-  - GHIDRA_INSTALL_DIR 或默认 C:/ghidra/ghidra12.1
+  - 当前目录布局与环境要求以 ../README.md 为准；Ghidra 位于仓库同级 ghidra_tools/
+  - 最新 Ghidra 12.2 使用 JDK 25；历史记录中的 12.1 路径不再适用
   - WSL（Windows 下 make/gcc 编译）
   - LLM_API_KEY（DeepSeek）
 

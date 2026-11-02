@@ -1,0 +1,5 @@
+{"schema_version": 1, "cases": [
+  {"id": "two", "args": ["2"]},
+  {"id": "three", "args": ["3"]},
+  {"id": "invalid_zero", "args": ["0"]}
+]}

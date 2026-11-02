@@ -52,6 +52,7 @@ GHIDRA_TYPES_TEMPLATE = """#ifndef GHIDRA_TYPES_H
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1855,10 +1856,24 @@ def dat_entries(binary, decomp_dir, files=None):
         if off is None or off >= len(data):
             entries.append((hexstr, False, b""))
             continue
-        chunk = data[off:off + 512]
+        # STT_OBJECT bounds distinguish strings from binary arrays with embedded NUL.
+        objects = list(binary.get("globals", {}).values()) + list(binary.get("norm_syms", {}).values())
+        bounds = [start + size for start, size in objects
+                  if start is not None and size > 0 and start <= off < start + size]
+        stop = min(bounds) if bounds else off + 512
+        # Never read across an unmapped/file-backed boundary, including PE overlay.
+        count = 0
+        while off + count < min(stop, len(data)) and va_to_offset(addr + count) == off + count:
+            count += 1
+        chunk = data[off:off + count]
         end = chunk.find(b"\x00")
-        raw = chunk if end == -1 else chunk[:end]
-        entries.append((hexstr, bool(raw and looks_like_string(raw)), raw))
+        prefix = chunk[:end] if end >= 0 else chunk
+        is_string = bool(end >= 0 and prefix and looks_like_string(prefix) and
+                         (not bounds or not any(chunk[end:])))
+        # The generated C literal contributes exactly one terminating NUL.
+        # Retain any additional padding bytes when the object's size is known.
+        raw = (chunk[:-1] if bounds else prefix) if is_string else chunk
+        entries.append((hexstr, is_string, raw))
     return entries
 
 
